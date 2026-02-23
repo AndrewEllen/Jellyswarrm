@@ -347,9 +347,17 @@ fn merge_server_items_interleaved(server_items: Vec<ItemsResponseVariants>) -> I
         .iter()
         .any(|items| matches!(items, ItemsResponseVariants::WithCount(_)))
     {
+        let total_record_count: i32 = server_items
+            .iter()
+            .map(|items| match items {
+                ItemsResponseVariants::WithCount(response) => response.total_record_count,
+                ItemsResponseVariants::Bare(items) => items.len() as i32,
+            })
+            .sum();
+
         ItemsResponseVariants::WithCount(ItemsResponseWithCount {
             items: interleaved_items,
-            total_record_count: count as i32,
+            total_record_count,
             start_index: 0,
         })
     } else {
@@ -529,6 +537,33 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert_eq!(ids, vec!["a1", "b1", "a2"]);
                 assert_eq!(with_count.total_record_count, 3);
+            }
+            ItemsResponseVariants::Bare(_) => panic!("Expected WithCount response"),
+        }
+    }
+
+    #[test]
+    fn test_merge_server_items_uses_federated_total_count() {
+        let a1 = build_grouped_user_view_item("a1", "A1", "movies", "srv", 1);
+        let b1 = build_grouped_user_view_item("b1", "B1", "movies", "srv", 1);
+
+        let merged = merge_server_items_interleaved(vec![
+            ItemsResponseVariants::WithCount(ItemsResponseWithCount {
+                items: vec![a1],
+                total_record_count: 1500,
+                start_index: 0,
+            }),
+            ItemsResponseVariants::WithCount(ItemsResponseWithCount {
+                items: vec![b1],
+                total_record_count: 700,
+                start_index: 0,
+            }),
+        ]);
+
+        match merged {
+            ItemsResponseVariants::WithCount(with_count) => {
+                assert_eq!(with_count.items.len(), 2);
+                assert_eq!(with_count.total_record_count, 2200);
             }
             ItemsResponseVariants::Bare(_) => panic!("Expected WithCount response"),
         }

@@ -2,13 +2,11 @@ use std::collections::{HashMap, HashSet};
 
 use askama::Template;
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, RawForm, State},
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
-    Form,
 };
 use jellyfin_api::JellyfinClient;
-use serde::Deserialize;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -76,11 +74,9 @@ pub struct LibrariesListTemplate {
     pub flash_is_error: bool,
 }
 
-#[derive(Deserialize)]
 pub struct LibraryForm {
     pub name: String,
     pub collection_type: String,
-    #[serde(default)]
     pub sources: Vec<String>,
 }
 
@@ -110,20 +106,55 @@ pub async fn get_library_list(State(state): State<AppState>) -> impl IntoRespons
 
 pub async fn add_library(
     State(state): State<AppState>,
-    Form(form): Form<LibraryForm>,
+    headers: HeaderMap,
+    RawForm(raw_form): RawForm,
 ) -> Response {
-    handle_save_library(&state, None, form).await
+    let form = match parse_library_form(raw_form.as_ref()) {
+        Ok(form) => form,
+        Err(message) => {
+            return render_library_list_with_status(
+                &state,
+                Some(message),
+                true,
+                StatusCode::BAD_REQUEST,
+                is_htmx_request(&headers),
+            )
+            .await;
+        }
+    };
+
+    handle_save_library(&state, None, form, is_htmx_request(&headers)).await
 }
 
 pub async fn update_library(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(group_id): Path<i64>,
-    Form(form): Form<LibraryForm>,
+    RawForm(raw_form): RawForm,
 ) -> Response {
-    handle_save_library(&state, Some(group_id), form).await
+    let form = match parse_library_form(raw_form.as_ref()) {
+        Ok(form) => form,
+        Err(message) => {
+            return render_library_list_with_status(
+                &state,
+                Some(message),
+                true,
+                StatusCode::BAD_REQUEST,
+                is_htmx_request(&headers),
+            )
+            .await;
+        }
+    };
+
+    handle_save_library(&state, Some(group_id), form, is_htmx_request(&headers)).await
 }
 
-pub async fn delete_library(State(state): State<AppState>, Path(group_id): Path<i64>) -> Response {
+pub async fn delete_library(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_id): Path<i64>,
+) -> Response {
+    let is_htmx = is_htmx_request(&headers);
     match state.library_management.delete_group(group_id).await {
         Ok(true) => {
             info!("Deleted grouped library {}", group_id);
@@ -144,7 +175,10 @@ pub async fn delete_library(State(state): State<AppState>, Path(group_id): Path<
         Ok(false) => {
             match render_library_list(&state, Some("Library group not found".to_string()), true).await
             {
-                Ok(html) => (StatusCode::NOT_FOUND, Html(html)).into_response(),
+                Ok(html) => {
+                    (normalize_htmx_status(StatusCode::NOT_FOUND, is_htmx), Html(html))
+                        .into_response()
+                }
                 Err(e) => {
                     error!("Failed to render library list after missing delete: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, "Template error").into_response()
@@ -160,7 +194,11 @@ pub async fn delete_library(State(state): State<AppState>, Path(group_id): Path<
             )
             .await
             {
-                Ok(html) => (StatusCode::INTERNAL_SERVER_ERROR, Html(html)).into_response(),
+                Ok(html) => (
+                    normalize_htmx_status(StatusCode::INTERNAL_SERVER_ERROR, is_htmx),
+                    Html(html),
+                )
+                    .into_response(),
                 Err(render_err) => {
                     error!("Failed to render library list after delete error: {}", render_err);
                     (StatusCode::INTERNAL_SERVER_ERROR, "Template error").into_response()
@@ -174,6 +212,7 @@ async fn handle_save_library(
     state: &AppState,
     group_id: Option<i64>,
     form: LibraryForm,
+    is_htmx: bool,
 ) -> Response {
     let (source_options, _) = discover_source_libraries(state).await;
     let mut source_map = HashMap::with_capacity(source_options.len());
@@ -189,6 +228,7 @@ async fn handle_save_library(
             Some("Invalid collection type".to_string()),
             true,
             StatusCode::BAD_REQUEST,
+            is_htmx,
         )
         .await;
     }
@@ -201,6 +241,7 @@ async fn handle_save_library(
                 Some(msg),
                 true,
                 StatusCode::BAD_REQUEST,
+                is_htmx,
             )
             .await;
         }
@@ -221,13 +262,17 @@ async fn handle_save_library(
     };
 
     match result {
-        Ok(Some(message)) => render_library_list_with_status(state, Some(message), false, StatusCode::OK).await,
+        Ok(Some(message)) => {
+            render_library_list_with_status(state, Some(message), false, StatusCode::OK, is_htmx)
+                .await
+        }
         Ok(None) => {
             render_library_list_with_status(
                 state,
                 Some("Library group not found".to_string()),
                 true,
                 StatusCode::NOT_FOUND,
+                is_htmx,
             )
             .await
         }
@@ -238,6 +283,7 @@ async fn handle_save_library(
                 Some(format!("Failed to save library group: {}", e)),
                 true,
                 StatusCode::BAD_REQUEST,
+                is_htmx,
             )
             .await
         }
@@ -249,14 +295,55 @@ async fn render_library_list_with_status(
     message: Option<String>,
     is_error: bool,
     status: StatusCode,
+    is_htmx: bool,
 ) -> Response {
     match render_library_list(state, message, is_error).await {
-        Ok(html) => (status, Html(html)).into_response(),
+        Ok(html) => (normalize_htmx_status(status, is_htmx), Html(html)).into_response(),
         Err(e) => {
             error!("Failed to render library list with status: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "Template error").into_response()
         }
     }
+}
+
+fn is_htmx_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("HX-Request")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn normalize_htmx_status(status: StatusCode, is_htmx: bool) -> StatusCode {
+    if is_htmx && !status.is_success() {
+        StatusCode::OK
+    } else {
+        status
+    }
+}
+
+fn parse_library_form(raw_form: &[u8]) -> Result<LibraryForm, String> {
+    let mut name = None;
+    let mut collection_type = None;
+    let mut sources = Vec::new();
+
+    for (key, value) in url::form_urlencoded::parse(raw_form) {
+        match key.as_ref() {
+            "name" => name = Some(value.into_owned()),
+            "collection_type" => collection_type = Some(value.into_owned()),
+            "sources" | "sources[]" => sources.push(value.into_owned()),
+            _ => {}
+        }
+    }
+
+    let name = name.unwrap_or_default();
+    let collection_type = collection_type.unwrap_or_default();
+
+    Ok(LibraryForm {
+        name,
+        collection_type,
+        sources,
+    })
 }
 
 async fn render_library_list(
@@ -585,4 +672,32 @@ fn folders_to_source_options(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_library_form;
+
+    #[test]
+    fn parse_library_form_accepts_repeated_sources_keys() {
+        let raw = b"name=Movies&collection_type=movies&sources=1%3A%3Aabc&sources=2%3A%3Adef";
+        let form = parse_library_form(raw).expect("should parse");
+        assert_eq!(form.name, "Movies");
+        assert_eq!(form.collection_type, "movies");
+        assert_eq!(
+            form.sources,
+            vec!["1::abc".to_string(), "2::def".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_library_form_accepts_bracketed_sources_keys() {
+        let raw =
+            b"name=Movies&collection_type=movies&sources%5B%5D=1%3A%3Aabc&sources%5B%5D=2%3A%3Adef";
+        let form = parse_library_form(raw).expect("should parse");
+        assert_eq!(
+            form.sources,
+            vec!["1::abc".to_string(), "2::def".to_string()]
+        );
+    }
 }
