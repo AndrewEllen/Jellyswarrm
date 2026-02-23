@@ -15,6 +15,7 @@ use crate::{
 };
 
 use anyhow::Result;
+use std::collections::HashMap;
 
 async fn process_user(
     server_user: crate::models::User,
@@ -34,10 +35,48 @@ async fn process_user(
 
 // http://foo:3000/users/public?)
 pub async fn handle_public(
-    _state: State<AppState>,
+    State(state): State<AppState>,
 ) -> Result<Json<Vec<crate::models::User>>, StatusCode> {
-    // For now, return an empty list
-    Ok(Json(vec![]))
+    let users = state
+        .user_authorization
+        .list_users()
+        .await
+        .map_err(|e| {
+            error!("Failed to list public users: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let server_id = state.config.read().await.server_id.clone();
+    let public_users = users
+        .into_iter()
+        .map(|user| {
+            let mut extra = HashMap::new();
+            extra.insert("HasPassword".to_string(), serde_json::Value::Bool(true));
+            extra.insert(
+                "HasConfiguredPassword".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            extra.insert(
+                "HasConfiguredEasyPassword".to_string(),
+                serde_json::Value::Bool(false),
+            );
+            extra.insert("EnableAutoLogin".to_string(), serde_json::Value::Bool(false));
+
+            crate::models::User {
+                name: user.original_username,
+                server_id: server_id.clone(),
+                id: user.id,
+                policy: crate::models::UserPolicy {
+                    is_administrator: false,
+                    sync_play_access: SyncPlayUserAccessType::CreateAndJoinGroups,
+                    extra: HashMap::new(),
+                },
+                extra,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(public_users))
 }
 
 pub async fn handle_get_me(
@@ -193,26 +232,27 @@ pub async fn handle_authenticate_by_name(
         }
     }
 
-    if is_existing_user {
-        if !servers.is_empty() {
+    if !servers.is_empty() {
+        if is_existing_user {
             info!(
-                "Skipping {} unmapped servers for existing user '{}' during login",
+                "Trying {} unmapped fallback servers for existing user '{}'",
+                servers.len(),
+                payload.username
+            );
+        } else {
+            info!(
+                "No server mapping found yet; probing {} servers for user '{}'",
                 servers.len(),
                 payload.username
             );
         }
-    } else {
-        // For first-time users we still probe all configured servers so mappings can be created.
+
         let mut leftover_tasks: Vec<_> = servers
             .into_iter()
             .map(|server| {
                 let state = state.clone();
                 let authentication = authentication.clone();
                 let payload = payload.clone();
-                info!(
-                    "No server mapping found for user '{}' on server '{}'",
-                    payload.username, server.name
-                );
 
                 tokio::spawn(async move {
                     authenticate_on_server(state, authentication, payload, server, None).await
@@ -377,28 +417,85 @@ async fn authenticate_on_server(
 
     let given_password = payload.password.clone();
 
-    let (final_username, final_password) = if let Some(mapping) = &server_mapping {
-        (
-            mapping.mapped_username.clone(),
-            state.user_authorization.decrypt_server_mapping_password(
-                mapping,
-                &given_password.clone().into(),
-                &admin_password.into(),
-                Some(&given_password),
-                Some(admin_password),
-            ),
+    let mut credential_candidates: Vec<(String, Password, &'static str)> = Vec::new();
+    if let Some(mapping) = &server_mapping {
+        let mapped_password = state.user_authorization.decrypt_server_mapping_password(
+            mapping,
+            &given_password.clone().into(),
+            &admin_password.into(),
+            Some(&given_password),
+            Some(admin_password),
+        );
+        credential_candidates.push((mapping.mapped_username.clone(), mapped_password, "mapped"));
+    }
+
+    let has_exact_provided_candidate = credential_candidates.iter().any(|(username, password, _)| {
+        username.trim().eq_ignore_ascii_case(payload.username.trim())
+            && password == &payload.password
+    });
+    if !has_exact_provided_candidate {
+        credential_candidates.push((
+            payload.username.clone(),
+            payload.password.clone(),
+            "provided",
+        ));
+    }
+
+    let mut last_error = AuthError::InvalidCredentials;
+    for (candidate_username, candidate_password, source) in credential_candidates {
+        debug!(
+            "Trying {} credentials for user '{}' on server '{}'",
+            source, payload.username, server.name
+        );
+
+        match authenticate_with_credentials(
+            &state,
+            &authorization,
+            &auth_url,
+            &server.name,
+            &candidate_username,
+            &candidate_password,
         )
-    } else {
-        (payload.username.clone(), payload.password.clone())
-    };
+        .await
+        {
+            Ok(auth_response) => {
+                info!(
+                    "Successfully authenticated user '{}' on server '{}' using {} credentials",
+                    payload.username, server.name, source
+                );
+                return Ok(SuccessfulServerAuth {
+                    server,
+                    auth_response,
+                    final_username: candidate_username,
+                    final_password: candidate_password,
+                });
+            }
+            Err(AuthError::InvalidCredentials) => {
+                last_error = AuthError::InvalidCredentials;
+            }
+            Err(other) => {
+                last_error = other;
+                break;
+            }
+        }
+    }
 
-    // Create authentication payload
+    Err(last_error)
+}
+
+async fn authenticate_with_credentials(
+    state: &AppState,
+    authorization: &Authorization,
+    auth_url: &url::Url,
+    server_name: &str,
+    username: &str,
+    password: &Password,
+) -> Result<AuthenticateResponse, AuthError> {
     let auth_payload = AuthenticateRequest {
-        username: final_username.clone(),
-        password: final_password.clone(),
+        username: username.to_string(),
+        password: password.clone(),
     };
 
-    // Make authentication request
     let response = state
         .reqwest_client
         .post(auth_url.as_str())
@@ -411,54 +508,40 @@ async fn authenticate_on_server(
         .map_err(|e| {
             tracing::error!(
                 "Failed to send authentication request to {}: {}",
-                server.name,
+                server_name,
                 e
             );
             AuthError::NetworkError(e.to_string())
         })?;
 
-    // Check response status
     if !response.status().is_success() {
         tracing::warn!(
             "Authentication failed for server '{}' with status: {}",
-            server.name,
+            server_name,
             response.status()
         );
         return Err(AuthError::InvalidCredentials);
     }
 
-    // Parse response
     let response_text = response.text().await.map_err(|e| {
         tracing::error!(
             "Failed to read authentication response from {}: {}",
-            server.name,
+            server_name,
             e
         );
         AuthError::NetworkError(e.to_string())
     })?;
 
-    tracing::trace!("Raw response from {}: {}", server.name, response_text);
+    tracing::trace!("Raw response from {}: {}", server_name, response_text);
 
-    let auth_response =
-        serde_json::from_str::<AuthenticateResponse>(&response_text).map_err(|e| {
-            tracing::error!(
-                "Failed to parse authentication response from {}: {}. Response body: {}",
-                server.name,
-                e,
-                response_text
-            );
-            AuthError::ParseError(e.to_string())
-        })?;
-
-    info!(
-        "Successfully authenticated user '{}' on server '{}'",
-        payload.username, server.name
-    );
-    Ok(SuccessfulServerAuth {
-        server,
-        auth_response,
-        final_username,
-        final_password,
+    serde_json::from_str::<AuthenticateResponse>(&response_text).map_err(|e| {
+        tracing::error!(
+            "Failed to parse authentication response from {}: {}. Response body: {}",
+            server_name,
+            e,
+            response_text
+        );
+        AuthError::ParseError(e.to_string())
     })
 }
 
@@ -468,7 +551,9 @@ fn extract_auth_header(headers: &HeaderMap) -> Result<Authorization, AuthError> 
         .get("authorization")
         .and_then(|value| value.to_str().ok())
     {
-        if let Ok(auth) = Authorization::parse(raw_auth) {
+        if let Ok(auth) = Authorization::parse(raw_auth)
+            .or_else(|_| Authorization::parse_with_legacy(raw_auth, true))
+        {
             debug!("Extracted 'Authorization' header: {}", raw_auth);
             Ok(auth)
         } else {

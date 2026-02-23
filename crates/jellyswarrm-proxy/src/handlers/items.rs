@@ -21,7 +21,7 @@ use crate::{
     models::{
         enums::{BaseItemKind, CollectionType},
         ItemsResponseVariants, ItemsResponseWithCount, MediaItem, MediaSource, PlaybackRequest,
-        PlaybackResponse, UserData,
+        PlaybackResponse,
     },
     request_preprocessing::{
         apply_to_request, extract_request_infos, preprocess_request, JellyfinAuthorization,
@@ -660,7 +660,6 @@ async fn try_get_grouped_item_with_sources(
     let server_id = { state.config.read().await.server_id.clone() };
     let mut canonical_item: Option<(i32, String, MediaItem)> = None;
     let mut merged_sources: Vec<MediaSource> = Vec::new();
-    let mut merged_user_data: Option<UserData> = None;
     let mut seen_source_ids = std::collections::HashSet::new();
 
     for (item_virtual_id, session, server) in candidates {
@@ -693,8 +692,6 @@ async fn try_get_grouped_item_with_sources(
 
         let mut processed_item =
             process_media_item(response_item, state, &server, false, &server_id).await?;
-
-        merged_user_data = merge_user_data(merged_user_data, processed_item.user_data.clone());
 
         if let Some(media_sources) = processed_item.media_sources.take() {
             for mut source in media_sources {
@@ -731,43 +728,7 @@ async fn try_get_grouped_item_with_sources(
     if !merged_sources.is_empty() {
         canonical_item.media_sources = Some(merged_sources);
     }
-    canonical_item.user_data = merge_user_data(canonical_item.user_data, merged_user_data);
     canonical_item.id = requested_item_id.to_string();
 
     Ok(Some(canonical_item))
-}
-
-fn merge_user_data(existing: Option<UserData>, incoming: Option<UserData>) -> Option<UserData> {
-    match (existing, incoming) {
-        (None, None) => None,
-        (Some(existing), None) => Some(existing),
-        (None, Some(incoming)) => Some(incoming),
-        (Some(mut existing), Some(incoming)) => {
-            existing.played = existing.played || incoming.played;
-            existing.is_favorite = existing.is_favorite || incoming.is_favorite;
-            existing.play_count = existing.play_count.max(incoming.play_count);
-            existing.playback_position_ticks = existing
-                .playback_position_ticks
-                .max(incoming.playback_position_ticks);
-            existing.unplayed_item_count = match (existing.unplayed_item_count, incoming.unplayed_item_count) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            };
-            existing.played_percentage = match (existing.played_percentage, incoming.played_percentage) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            };
-            existing.last_played_date = match (existing.last_played_date, incoming.last_played_date) {
-                (Some(a), Some(b)) => Some(if b > a { b } else { a }),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            };
-            Some(existing)
-        }
-    }
 }

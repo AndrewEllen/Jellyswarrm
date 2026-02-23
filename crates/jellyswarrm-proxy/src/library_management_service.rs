@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, SqlitePool};
+use uuid::Uuid;
 
 use crate::models::generate_token;
 
@@ -138,6 +139,7 @@ impl LibraryManagementService {
         &self,
         virtual_id: &str,
     ) -> Result<Option<LibraryGroupWithSources>, sqlx::Error> {
+        let normalized_virtual_id = Self::normalize_virtual_id(virtual_id);
         let group = sqlx::query_as::<_, LibraryGroup>(
             r#"
             SELECT id, virtual_library_id, name, collection_type, preview_server_id, preview_library_id, created_at, updated_at
@@ -145,7 +147,7 @@ impl LibraryManagementService {
             WHERE virtual_library_id = ?
             "#,
         )
-        .bind(virtual_id)
+        .bind(normalized_virtual_id)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -323,6 +325,7 @@ impl LibraryManagementService {
         &self,
         virtual_id: &str,
     ) -> Result<Option<PreviewSourceResolution>, sqlx::Error> {
+        let normalized_virtual_id = Self::normalize_virtual_id(virtual_id);
         sqlx::query_as::<_, PreviewSourceResolution>(
             r#"
             SELECT
@@ -336,7 +339,7 @@ impl LibraryManagementService {
             WHERE virtual_library_id = ?
             "#,
         )
-        .bind(virtual_id)
+        .bind(normalized_virtual_id)
         .fetch_optional(&self.pool)
         .await
     }
@@ -346,6 +349,7 @@ impl LibraryManagementService {
         virtual_id: &str,
         server_id: i64,
     ) -> Result<Option<LibraryGroupSource>, sqlx::Error> {
+        let normalized_virtual_id = Self::normalize_virtual_id(virtual_id);
         sqlx::query_as::<_, LibraryGroupSource>(
             r#"
             SELECT
@@ -363,10 +367,17 @@ impl LibraryManagementService {
             LIMIT 1
             "#,
         )
-        .bind(virtual_id)
+        .bind(normalized_virtual_id)
         .bind(server_id)
         .fetch_optional(&self.pool)
         .await
+    }
+
+    fn normalize_virtual_id(value: &str) -> String {
+        match Uuid::parse_str(value.trim()) {
+            Ok(uuid) => uuid.simple().to_string(),
+            Err(_) => value.trim().to_string(),
+        }
     }
 
     async fn list_sources_for_group(

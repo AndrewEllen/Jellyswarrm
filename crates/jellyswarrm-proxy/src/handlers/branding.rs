@@ -1,6 +1,7 @@
 use axum::{extract::State, Json};
 use hyper::StatusCode;
 use jellyfin_api::JellyfinClient;
+use tracing::debug;
 
 use crate::{models::BrandingConfig, AppState};
 
@@ -28,23 +29,31 @@ pub async fn handle_branding(
             .collect();
         message.push_str(&server_links.join(", "));
 
+        // Use the first reachable server in priority order as branding source-of-truth.
+        // `list_servers` is already ordered by priority DESC.
         for server in servers {
-            if state
-                .server_storage
-                .server_status(server.id)
-                .await
-                .is_healthy()
-            {
-                if let Ok(client) = JellyfinClient::new_with_client(
-                    server.url.as_ref(),
-                    state.server_storage.client_info.clone(),
-                    state.server_storage.http_client.clone(),
-                ) {
-                    if let Ok(branding) = client.get_branding_configuration().await {
-                        if let Some(remote_custom_css) = branding.custom_css {
-                            custom_css = remote_custom_css;
-                        }
-                    }
+            let Ok(client) = JellyfinClient::new_with_client(
+                server.url.as_ref(),
+                state.server_storage.client_info.clone(),
+                state.server_storage.http_client.clone(),
+            ) else {
+                continue;
+            };
+
+            match client.get_branding_configuration().await {
+                Ok(branding) => {
+                    custom_css = branding.custom_css.unwrap_or_default();
+                    debug!(
+                        "Using branding configuration from priority server '{}'",
+                        server.name
+                    );
+                    break;
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to fetch branding from server '{}': {}",
+                        server.name, e
+                    );
                 }
             }
         }

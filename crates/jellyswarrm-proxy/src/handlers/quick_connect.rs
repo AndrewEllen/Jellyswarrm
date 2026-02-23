@@ -219,7 +219,8 @@ fn parse_client_info(headers: &HeaderMap) -> (String, String, String, String) {
         .get("authorization")
         .and_then(|value| value.to_str().ok())
     {
-        match Authorization::parse(header) {
+        match Authorization::parse(header).or_else(|_| Authorization::parse_with_legacy(header, true))
+        {
             Ok(auth) => {
                 return (auth.device_id, auth.device, auth.client, auth.version);
             }
@@ -336,7 +337,9 @@ fn extract_virtual_token(headers: &HeaderMap) -> Option<String> {
         .get("authorization")
         .and_then(|value| value.to_str().ok())
     {
-        if let Ok(auth) = Authorization::parse(header) {
+        if let Ok(auth) =
+            Authorization::parse(header).or_else(|_| Authorization::parse_with_legacy(header, true))
+        {
             if let Some(token) = auth.token {
                 return Some(token);
             }

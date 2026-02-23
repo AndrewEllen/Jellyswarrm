@@ -10,6 +10,7 @@ use tracing::error;
 
 use crate::{
     config::{save_config, MediaStreamingMode},
+    watch_sync_service,
     AppState,
 };
 
@@ -119,4 +120,32 @@ pub async fn reload_config(State(state): State<AppState>) -> impl IntoResponse {
         *cfg = new_cfg;
     }
     Html("<div class=\"alert\">Configuration reloaded</div>")
+}
+
+pub async fn sync_watch_data_task(State(state): State<AppState>) -> impl IntoResponse {
+    let started = std::time::Instant::now();
+    let report = watch_sync_service::sync_watch_data_from_priority_servers(&state).await;
+    let elapsed = started.elapsed().as_secs_f32();
+
+    let html = format!(
+        "<article><header><strong>Watch sync finished ({elapsed:.1}s)</strong></header>\
+<p>Groups discovered: {} | Eligible groups: {} | Users: {} | Users with mappings: {} | Authenticated users: {}</p>\
+<p>Pairs checked: {} | Updates applied: {} | Already in sync: {} | Missing items: {} | Missing sessions: {}</p>\
+<p>Auth failures: {} | Request failures: {} | Mapping misses: {}</p></article>",
+        report.dedupe_groups_total,
+        report.dedupe_groups_eligible,
+        report.users_total,
+        report.users_with_mappings,
+        report.users_authenticated,
+        report.sync_pairs_checked,
+        report.updates_applied,
+        report.already_in_sync,
+        report.skipped_missing_items,
+        report.skipped_missing_sessions,
+        report.authentication_failures,
+        report.request_failures,
+        report.mapping_resolution_misses,
+    );
+
+    Html(html)
 }

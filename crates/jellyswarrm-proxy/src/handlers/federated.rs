@@ -20,7 +20,7 @@ use crate::{
     media_storage_service::MediaDedupeMember,
     models::{
         enums::{BaseItemKind, CollectionType},
-        ItemsResponseVariants, ItemsResponseWithCount, MediaItem, UserData,
+        ItemsResponseVariants, ItemsResponseWithCount, MediaItem,
     },
     request_preprocessing::{apply_to_request, extract_request_infos, JellyfinAuthorization},
     server_storage::Server,
@@ -477,18 +477,27 @@ async fn dedupe_interleaved_items(
     interleaved_items: Vec<InterleavedItemWithServer>,
 ) -> Vec<MediaItem> {
     let mut deduped_items: Vec<MediaItem> = Vec::new();
-    let mut entries_by_key: HashMap<String, DedupedItemEntry> = HashMap::new();
+    let mut dedupe_entries: Vec<DedupedItemEntry> = Vec::new();
+    let mut entry_index_by_key: HashMap<String, usize> = HashMap::new();
 
     for interleaved in interleaved_items {
         let item = interleaved.item;
         let server = interleaved.server;
 
-        let Some(dedupe_key) = build_media_dedupe_key(&item) else {
+        let dedupe_keys = build_media_dedupe_keys(&item);
+        if dedupe_keys.is_empty() {
             deduped_items.push(item);
             continue;
-        };
+        }
 
-        if let Some(existing) = entries_by_key.get_mut(&dedupe_key) {
+        let existing_entry_index = dedupe_keys
+            .iter()
+            .find_map(|key| entry_index_by_key.get(key).copied());
+
+        if let Some(entry_index) = existing_entry_index {
+            let existing = dedupe_entries
+                .get_mut(entry_index)
+                .expect("entry index must point to a valid dedupe entry");
             existing
                 .members
                 .entry(server.id)
@@ -497,15 +506,11 @@ async fn dedupe_interleaved_items(
             if server.priority > existing.canonical_priority {
                 existing.canonical_priority = server.priority;
                 existing.canonical_id = item.id.clone();
-                let merged_user_data =
-                    merge_user_data(deduped_items[existing.output_index].user_data.clone(), item.user_data.clone());
                 deduped_items[existing.output_index] = item;
-                deduped_items[existing.output_index].user_data = merged_user_data;
-            } else {
-                deduped_items[existing.output_index].user_data = merge_user_data(
-                    deduped_items[existing.output_index].user_data.clone(),
-                    item.user_data.clone(),
-                );
+            }
+
+            for key in dedupe_keys {
+                entry_index_by_key.entry(key).or_insert(entry_index);
             }
             continue;
         }
@@ -513,8 +518,8 @@ async fn dedupe_interleaved_items(
         let output_index = deduped_items.len();
         let mut members = HashMap::new();
         members.insert(server.id, item.id.clone());
-        entries_by_key.insert(
-            dedupe_key,
+        let entry_index = dedupe_entries.len();
+        dedupe_entries.push(
             DedupedItemEntry {
                 output_index,
                 canonical_id: item.id.clone(),
@@ -523,10 +528,14 @@ async fn dedupe_interleaved_items(
             },
         );
 
+        for key in dedupe_keys {
+            entry_index_by_key.insert(key, entry_index);
+        }
+
         deduped_items.push(item);
     }
 
-    for entry in entries_by_key.into_values() {
+    for entry in dedupe_entries {
         if entry.members.len() <= 1 {
             continue;
         }
@@ -549,42 +558,7 @@ async fn dedupe_interleaved_items(
     deduped_items
 }
 
-fn merge_user_data(existing: Option<UserData>, incoming: Option<UserData>) -> Option<UserData> {
-    match (existing, incoming) {
-        (None, None) => None,
-        (Some(existing), None) => Some(existing),
-        (None, Some(incoming)) => Some(incoming),
-        (Some(mut existing), Some(incoming)) => {
-            existing.played = existing.played || incoming.played;
-            existing.is_favorite = existing.is_favorite || incoming.is_favorite;
-            existing.play_count = existing.play_count.max(incoming.play_count);
-            existing.playback_position_ticks = existing
-                .playback_position_ticks
-                .max(incoming.playback_position_ticks);
-            existing.unplayed_item_count = match (existing.unplayed_item_count, incoming.unplayed_item_count) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            };
-            existing.played_percentage = match (existing.played_percentage, incoming.played_percentage) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            };
-            existing.last_played_date = match (existing.last_played_date, incoming.last_played_date) {
-                (Some(a), Some(b)) => Some(if b > a { b } else { a }),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            };
-            Some(existing)
-        }
-    }
-}
-
-fn build_media_dedupe_key(item: &MediaItem) -> Option<String> {
+fn build_media_dedupe_keys(item: &MediaItem) -> Vec<String> {
     let kind = normalize_item_kind(&item.item_type);
     if !matches!(
         item.item_type,
@@ -597,39 +571,48 @@ fn build_media_dedupe_key(item: &MediaItem) -> Option<String> {
             | BaseItemKind::CollectionFolder
             | BaseItemKind::Trailer
     ) {
-        return None;
+        return Vec::new();
     }
 
+    let mut keys = Vec::new();
+
     if let Some(provider_key) = provider_ids_key(item) {
-        return Some(format!("provider|{kind}|{provider_key}"));
+        keys.push(format!("provider|{kind}|{provider_key}"));
     }
 
     match item.item_type {
         BaseItemKind::Episode => {
-            let series = normalize_opt_string(item.series_name.as_deref());
+            let series = normalize_media_title(item.series_name.as_deref());
             let season_number = extract_i64_field(item, "ParentIndexNumber");
             let episode_number = extract_i64_field(item, "IndexNumber");
             if let (Some(series), Some(season), Some(episode)) = (series, season_number, episode_number)
             {
-                return Some(format!("episode|{series}|{season}|{episode}"));
+                keys.push(format!("episode|{series}|{season}|{episode}"));
             }
         }
         BaseItemKind::Season => {
-            let series = normalize_opt_string(item.series_name.as_deref());
+            let series = normalize_media_title(item.series_name.as_deref());
             let season_number = extract_i64_field(item, "IndexNumber");
             if let (Some(series), Some(season)) = (series, season_number) {
-                return Some(format!("season|{series}|{season}"));
+                keys.push(format!("season|{series}|{season}"));
             }
         }
         _ => {}
     }
 
-    let name = normalize_opt_string(item.name.as_deref())
-        .or_else(|| normalize_opt_string(item.original_title.as_deref()))?;
-    let year = extract_i64_field(item, "ProductionYear")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "na".to_string());
-    Some(format!("nameyear|{kind}|{name}|{year}"))
+    if let Some(name) = normalize_media_title(item.name.as_deref())
+        .or_else(|| normalize_media_title(item.original_title.as_deref()))
+    {
+        if let Some(year) = extract_i64_field(item, "ProductionYear") {
+            keys.push(format!("nameyear|{kind}|{name}|{year}"));
+        } else {
+            keys.push(format!("name|{kind}|{name}"));
+        }
+    }
+
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 fn provider_ids_key(item: &MediaItem) -> Option<String> {
@@ -688,6 +671,20 @@ fn normalize_opt_string(input: Option<&str>) -> Option<String> {
     }
 
     Some(input.to_ascii_lowercase())
+}
+
+fn normalize_media_title(input: Option<&str>) -> Option<String> {
+    let normalized = normalize_opt_string(input)?;
+    let compact = normalized
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .collect::<String>();
+
+    if compact.is_empty() {
+        Some(normalized)
+    } else {
+        Some(compact)
+    }
 }
 
 pub(crate) fn sort_options_from_url(url: &url::Url) -> Option<SortOptions> {
@@ -1014,10 +1011,10 @@ mod tests {
             "Imdb": "tt123"
         }));
 
-        let key = build_media_dedupe_key(&item).unwrap();
-        assert!(key.contains("provider|movie|"));
-        assert!(key.contains("imdb=tt123"));
-        assert!(key.contains("tmdb=123"));
+        let keys = build_media_dedupe_keys(&item);
+        assert!(keys.iter().any(|key| key.contains("provider|movie|")));
+        assert!(keys.iter().any(|key| key.contains("imdb=tt123")));
+        assert!(keys.iter().any(|key| key.contains("tmdb=123")));
     }
 
     #[test]
@@ -1030,7 +1027,24 @@ mod tests {
         item.extra
             .insert("IndexNumber".to_string(), serde_json::json!(2));
 
-        let key = build_media_dedupe_key(&item).unwrap();
-        assert_eq!(key, "episode|example show|1|2");
+        let keys = build_media_dedupe_keys(&item);
+        assert!(keys.contains(&"episode|exampleshow|1|2".to_string()));
+    }
+
+    #[test]
+    fn test_build_media_dedupe_key_name_fallback_handles_punctuation_and_missing_year() {
+        let mut with_punctuation =
+            build_grouped_user_view_item("m1", "Ant-Man", "movies", "srv", 1);
+        with_punctuation.item_type = BaseItemKind::Movie;
+
+        let mut without_punctuation =
+            build_grouped_user_view_item("m2", "Antman", "movies", "srv", 1);
+        without_punctuation.item_type = BaseItemKind::Movie;
+
+        let keys_a = build_media_dedupe_keys(&with_punctuation);
+        let keys_b = build_media_dedupe_keys(&without_punctuation);
+
+        assert!(keys_a.contains(&"name|movie|antman".to_string()));
+        assert!(keys_b.contains(&"name|movie|antman".to_string()));
     }
 }

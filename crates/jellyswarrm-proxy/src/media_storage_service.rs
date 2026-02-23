@@ -1,8 +1,9 @@
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use sqlx::{FromRow, Row, SqlitePool};
 use tracing::{debug, error, info, trace};
 use uuid::Uuid;
+use tokio::sync::RwLock;
 
 use crate::models::generate_token;
 use crate::server_storage::Server;
@@ -36,6 +37,7 @@ pub struct MediaStorageService {
     mapping_with_server_cache: Cache<String, (MediaMapping, Server)>,
     dedupe_group_cache: Cache<String, MediaDedupeGroup>,
     dedupe_member_index_cache: Cache<String, String>,
+    dedupe_group_index: Arc<RwLock<HashMap<String, MediaDedupeGroup>>>,
 }
 
 impl MediaStorageService {
@@ -58,6 +60,7 @@ impl MediaStorageService {
                 .time_to_live(Duration::from_secs(60 * 60 * 6))
                 .max_capacity(500_000)
                 .build(),
+            dedupe_group_index: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -115,15 +118,18 @@ impl MediaStorageService {
             )
             .await;
 
+        let group = MediaDedupeGroup {
+            canonical_virtual_media_id: canonical_virtual_media_id.clone(),
+            members: deduped_members,
+        };
+
         self.dedupe_group_cache
-            .insert(
-                canonical_virtual_media_id.clone(),
-                MediaDedupeGroup {
-                    canonical_virtual_media_id,
-                    members: deduped_members,
-                },
-            )
+            .insert(canonical_virtual_media_id.clone(), group.clone())
             .await;
+        self.dedupe_group_index
+            .write()
+            .await
+            .insert(canonical_virtual_media_id, group);
     }
 
     pub async fn get_media_dedupe_group(
@@ -138,6 +144,15 @@ impl MediaStorageService {
         }
 
         self.dedupe_group_cache.get(&media_virtual_id).await
+    }
+
+    pub async fn list_media_dedupe_groups(&self) -> Vec<MediaDedupeGroup> {
+        self.dedupe_group_index
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub async fn get_media_dedupe_member_for_server(
@@ -372,7 +387,9 @@ impl MediaStorageService {
             self.mapping_with_server_cache
                 .invalidate(virtual_media_id)
                 .await;
-            self.dedupe_member_index_cache.invalidate(virtual_media_id).await;
+            self.dedupe_group_cache.invalidate_all();
+            self.dedupe_member_index_cache.invalidate_all();
+            self.dedupe_group_index.write().await.clear();
             info!("Deleted media mapping: {}", virtual_media_id);
             Ok(true)
         } else {
@@ -405,6 +422,7 @@ impl MediaStorageService {
         self.mapping_with_server_cache.invalidate_all();
         self.dedupe_group_cache.invalidate_all();
         self.dedupe_member_index_cache.invalidate_all();
+        self.dedupe_group_index.write().await.clear();
         Ok(deleted_count)
     }
 }

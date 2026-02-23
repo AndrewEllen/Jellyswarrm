@@ -133,6 +133,10 @@ pub fn ui_routes() -> axum::Router<AppState> {
         .route("/settings/form", get(admin::settings::settings_form))
         .route("/settings/save", post(admin::settings::save_settings))
         .route("/settings/reload", post(admin::settings::reload_config))
+        .route(
+            "/settings/sync-watch-data",
+            post(admin::settings::sync_watch_data_task),
+        )
         // Libraries
         .route("/libraries", get(admin::libraries::libraries_page))
         .route("/libraries/list", get(admin::libraries::get_library_list))

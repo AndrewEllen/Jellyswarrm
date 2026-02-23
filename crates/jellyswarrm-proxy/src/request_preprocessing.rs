@@ -158,7 +158,9 @@ impl JellyfinAuthorization {
         let headers = req.headers();
         if let Some(auth_header) = headers.get("authorization") {
             if let Ok(auth_str) = auth_header.to_str() {
-                if let Ok(auth) = Authorization::parse(auth_str) {
+                if let Ok(auth) = Authorization::parse(auth_str)
+                    .or_else(|_| Authorization::parse_with_legacy(auth_str, true))
+                {
                     return Some(JellyfinAuthorization::Authorization(auth));
                 }
             }
@@ -166,7 +168,7 @@ impl JellyfinAuthorization {
 
         if let Some(auth_header) = headers.get("x-emby-authorization") {
             if let Ok(auth_str) = auth_header.to_str() {
-                if let Ok(auth) = Authorization::parse(auth_str) {
+                if let Ok(auth) = Authorization::parse_with_legacy(auth_str, true) {
                     return Some(JellyfinAuthorization::XEmbyAuthorization(auth));
                 }
             }
@@ -270,15 +272,14 @@ pub async fn extract_request_infos(
     };
 
     let sessions = if let Some(user) = &user {
-        let sessions = state
+        let mut sessions = state
             .user_authorization
-            .get_user_sessions(&user.id, device)
+            .get_user_sessions(&user.id, device.clone())
             .await?;
 
-        // filter for online servers only
         let mut filtered_sessions: Vec<(AuthorizationSession, Server)> =
             Vec::with_capacity(sessions.len());
-        for (session, server) in sessions {
+        for (session, server) in sessions.drain(..) {
             if state
                 .server_storage
                 .server_status(server.id)
@@ -286,6 +287,28 @@ pub async fn extract_request_infos(
                 .is_healthy()
             {
                 filtered_sessions.push((session, server));
+            }
+        }
+
+        if filtered_sessions.is_empty() && device.is_some() {
+            debug!(
+                "No device-scoped sessions found for user {}; falling back to any device",
+                user.id
+            );
+
+            let mut fallback_sessions = state
+                .user_authorization
+                .get_user_sessions(&user.id, None)
+                .await?;
+            for (session, server) in fallback_sessions.drain(..) {
+                if state
+                    .server_storage
+                    .server_status(server.id)
+                    .await
+                    .is_healthy()
+                {
+                    filtered_sessions.push((session, server));
+                }
             }
         }
 

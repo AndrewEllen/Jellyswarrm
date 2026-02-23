@@ -34,3 +34,23 @@
   </div>
   <p style="font-size:.75rem; opacity:.7; margin-top:.5rem;">Edits persist to TOML.</p>
 </form>
+
+<hr>
+
+<section>
+  <h4>Maintenance Tasks</h4>
+  <p style="margin-top:.25rem;">Run one-off maintenance jobs from the admin console.</p>
+  <div style="display:flex; gap:.5rem; flex-wrap:wrap;">
+    <button
+      type="button"
+      class="secondary"
+      hx-post="/{{ ui_route }}/settings/sync-watch-data"
+      hx-target="#settings-task-result"
+      hx-swap="innerHTML"
+      hx-disabled-elt="this"
+    >
+      Sync Watch Data Now
+    </button>
+  </div>
+  <div id="settings-task-result" style="margin-top:.75rem;"></div>
+</section>

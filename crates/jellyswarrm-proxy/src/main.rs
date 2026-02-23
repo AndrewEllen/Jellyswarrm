@@ -40,6 +40,7 @@ mod session_storage;
 mod ui;
 mod url_helper;
 mod user_authorization_service;
+mod watch_sync_service;
 
 use federated_users::FederatedUserService;
 use handlers::syncplay::SyncPlayService;
