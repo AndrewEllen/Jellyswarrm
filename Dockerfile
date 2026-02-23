@@ -3,34 +3,34 @@
 #################################
 FROM node:20-alpine AS ui-build
 
-# Install git for version detection
+# Install git for version detection and fallback clone
 RUN apk add --no-cache git
 
-WORKDIR /app/ui
+WORKDIR /app
 
-# Copy package files for dependency caching
-COPY ui/package.json ui/package-lock.json* ./
+# Copy local UI checkout if present (submodule or plain dir)
+COPY ui/ /app/ui/
+COPY .gitmodules /app/.gitmodules
+
+# If submodule was not initialized locally, bootstrap from upstream.
+RUN if [ ! -f /app/ui/package.json ]; then \
+      UI_REPO_URL="$(git config -f /app/.gitmodules --get submodule.ui.url || true)"; \
+      if [ -z "$UI_REPO_URL" ]; then UI_REPO_URL="https://github.com/jellyfin/jellyfin-web.git"; fi; \
+      rm -rf /app/ui && git clone --depth 1 "$UI_REPO_URL" /app/ui; \
+    fi
+
+WORKDIR /app/ui
 
 # Install all dependencies (including dev deps needed for build)
 RUN --mount=type=cache,target=/root/.npm \
     npm install --engine-strict=false --ignore-scripts
 
-# Copy UI source code and git metadata
-COPY ui/ ./
-COPY .git/modules/ui/ /app/.git/modules/ui/
-
-# Get and print UI version info
-RUN UI_VERSION=$(git describe --tags --abbrev=0) && \
-    UI_COMMIT=$(git rev-parse HEAD) && \
-    echo "UI_VERSION=${UI_VERSION#v}" && \
-    echo "UI_COMMIT=$UI_COMMIT"
-
 # Build production UI bundle
 RUN npm run build:production
 
 # Write ui-version.env file
-RUN UI_VERSION=$(git describe --tags --abbrev=0) && \
-    UI_COMMIT=$(git rev-parse HEAD) && \
+RUN UI_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || node -p "require('./package.json').version" 2>/dev/null || echo "unknown") && \
+    UI_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown") && \
     printf "UI_VERSION=%s\nUI_COMMIT=%s\n" "${UI_VERSION#v}" "$UI_COMMIT" > dist/ui-version.env && \
     echo "Generated dist/ui-version.env"
 
@@ -122,4 +122,3 @@ COPY --from=rust-build /app/jellyswarrm-proxy /app/jellyswarrm-proxy
 EXPOSE 3000
 
 ENTRYPOINT ["/app/jellyswarrm-proxy"]
-

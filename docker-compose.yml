@@ -6,10 +6,10 @@ services:
     image: jellyswarrm-proxy:latest
     container_name: jellyswarrm-proxy
     ports:
-      - "3000:3000"
+      - "3001:3000"
     volumes:
       - ./data:/app/data
     environment:
       - JELLYSWARRM_USERNAME=admin
-      - JELLYSWARRM_PASSWORD=jellyswarrm # Change this in production!
+      - JELLYSWARRM_PASSWORD=admin
       - RUST_LOG=jellyswarrm_proxy=debug 

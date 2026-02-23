@@ -1,0 +1,219 @@
+{% if let Some(message) = flash_message %}
+<div class="{% if flash_is_error %}alert alert-error{% else %}alert{% endif %}">
+    {{ message }}
+</div>
+{% endif %}
+
+<section>
+    <h2 style="margin-bottom: 0.5rem;">Create Grouped Library</h2>
+    <form
+        class="library-form"
+        id="create-library-form"
+        hx-post="/{{ ui_route }}/libraries"
+        hx-target="#library-list"
+        hx-swap="innerHTML"
+        hx-disabled-elt="this"
+    >
+        <div class="grid" style="--pico-grid-gap: 1rem; align-items: end;">
+            <label>Group Name
+                <input type="text" name="name" placeholder="e.g. Movies" required style="margin-bottom: 0;">
+            </label>
+            <label>Collection Type
+                <select name="collection_type" required style="margin-bottom: 0;">
+                    {% for ct in collection_types %}
+                    <option value="{{ ct.value }}">{{ ct.label }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>&nbsp;
+                <button type="submit" style="margin-bottom: 0;">Create Group</button>
+            </label>
+        </div>
+
+        <fieldset style="margin-top: 1rem;">
+            <legend>Select source libraries</legend>
+            {% if source_options.is_empty() %}
+            <p><small>No selectable source libraries found. Ensure connected servers have either admin credentials or active mapped-user sessions.</small></p>
+            {% else %}
+            <div style="max-height: 16rem; overflow: auto; border: 1px solid var(--pico-muted-border-color); padding: 0.75rem; border-radius: 0.5rem;">
+                {% for source in source_options %}
+                <label data-source-option data-ctype="{{ source.collection_type }}" style="display: block; margin-bottom: 0.35rem;">
+                    <input type="checkbox" name="sources" value="{{ source.key }}">
+                    <span>
+                        <strong>{{ source.server_name }}</strong> - {{ source.library_name }}
+                        <small>({{ source.collection_type }} via {{ source.auth_source }})</small>
+                    </span>
+                </label>
+                {% endfor %}
+            </div>
+            {% endif %}
+        </fieldset>
+    </form>
+</section>
+
+<hr>
+
+<section>
+    <h2 style="margin-bottom: 0.5rem;">Discovery Status</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Server</th>
+                <th>Auth Source</th>
+                <th>Selectable Libraries</th>
+                <th>Status</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for status in server_statuses %}
+            <tr>
+                <td>{{ status.server_name }}</td>
+                <td>
+                    {% if let Some(source) = status.auth_source %}
+                    {{ source }}
+                    {% else %}
+                    -
+                    {% endif %}
+                </td>
+                <td>{{ status.library_count }}</td>
+                <td>
+                    {% if let Some(msg) = status.message %}
+                    <small style="color: var(--pico-del-color);">{{ msg }}</small>
+                    {% else %}
+                    <small>OK</small>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<hr>
+
+<section>
+    <h2 style="margin-bottom: 0.5rem;">Configured Groups</h2>
+    {% if groups.is_empty() %}
+    <article>
+        <header><h4>No grouped libraries configured</h4></header>
+        <p>Create your first grouped library above.</p>
+    </article>
+    {% else %}
+        {% for group in groups %}
+        <article id="group-{{ group.id }}">
+            <header style="display: flex; align-items: center; justify-content: space-between; gap: 1rem;">
+                <div>
+                    <h3 style="margin: 0;">{{ group.name }}</h3>
+                    <small>{{ group.collection_type }} - {{ group.virtual_library_id }}</small>
+                </div>
+                <form
+                    hx-delete="/{{ ui_route }}/libraries/{{ group.id }}"
+                    hx-target="#library-list"
+                    hx-swap="innerHTML"
+                    hx-confirm="Delete grouped library '{{ group.name }}'?"
+                    style="margin: 0;"
+                >
+                    <button type="submit" class="outline secondary" style="margin-bottom: 0;">Delete</button>
+                </form>
+            </header>
+
+            <details style="margin-top: 0.75rem;">
+                <summary>Edit Group</summary>
+                <form
+                    class="library-form"
+                    hx-patch="/{{ ui_route }}/libraries/{{ group.id }}"
+                    hx-target="#library-list"
+                    hx-swap="innerHTML"
+                    hx-disabled-elt="this"
+                >
+                    <div class="grid" style="--pico-grid-gap: 1rem; align-items: end;">
+                        <label>Group Name
+                            <input type="text" name="name" value="{{ group.name }}" required style="margin-bottom: 0;">
+                        </label>
+                        <label>Collection Type
+                            <select name="collection_type" required style="margin-bottom: 0;">
+                                {% for ct in collection_types %}
+                                <option value="{{ ct.value }}" {% if group.collection_type == ct.value %}selected{% endif %}>{{ ct.label }}</option>
+                                {% endfor %}
+                            </select>
+                        </label>
+                        <label>&nbsp;
+                            <button type="submit" style="margin-bottom: 0;">Save</button>
+                        </label>
+                    </div>
+
+                    <fieldset style="margin-top: 1rem;">
+                        <legend>Sources</legend>
+                        <div style="max-height: 14rem; overflow: auto; border: 1px solid var(--pico-muted-border-color); padding: 0.75rem; border-radius: 0.5rem;">
+                            {% for source in group.source_choices %}
+                            <label data-source-option data-ctype="{{ source.collection_type }}" style="display: block; margin-bottom: 0.35rem;">
+                                <input
+                                    type="checkbox"
+                                    name="sources"
+                                    value="{{ source.key }}"
+                                    {% if source.checked %}checked{% endif %}
+                                >
+                                <span>
+                                    <strong>{{ source.server_name }}</strong> - {{ source.library_name }}
+                                    <small>({{ source.collection_type }} via {{ source.auth_source }})</small>
+                                </span>
+                            </label>
+                            {% endfor %}
+                        </div>
+                    </fieldset>
+                </form>
+            </details>
+
+            <p style="margin-top: 0.75rem; margin-bottom: 0.5rem;"><strong>Current sources</strong></p>
+            <ul style="margin-top: 0;">
+                {% for source_label in group.source_descriptions %}
+                <li>{{ source_label }}</li>
+                {% endfor %}
+            </ul>
+        </article>
+        {% endfor %}
+    {% endif %}
+</section>
+
+<script>
+(() => {
+    function applyFilter(form) {
+        const select = form.querySelector('select[name="collection_type"]');
+        if (!select) return;
+        const selectedType = (select.value || '').toLowerCase();
+        const options = form.querySelectorAll('[data-source-option]');
+        options.forEach((option) => {
+            const type = (option.dataset.ctype || '').toLowerCase();
+            const checkbox = option.querySelector('input[type="checkbox"]');
+            const matches = type === selectedType;
+            option.style.display = matches ? 'block' : 'none';
+            if (checkbox) {
+                checkbox.disabled = !matches;
+                if (!matches) checkbox.checked = false;
+            }
+        });
+    }
+
+    function bindFilters() {
+        document.querySelectorAll('#library-list .library-form').forEach((form) => {
+            const select = form.querySelector('select[name="collection_type"]');
+            if (!select) return;
+            select.removeEventListener('change', form.__jsLibraryFilterHandler);
+            const handler = () => applyFilter(form);
+            form.__jsLibraryFilterHandler = handler;
+            select.addEventListener('change', handler);
+            applyFilter(form);
+        });
+    }
+
+    bindFilters();
+    if (!window.__libraryListFilterBound) {
+        document.body.addEventListener('htmx:afterSwap', (event) => {
+            if (event.target && event.target.id === 'library-list') {
+                bindFilters();
+            }
+        });
+        window.__libraryListFilterBound = true;
+    }
+})();
+</script>

@@ -378,6 +378,28 @@ pub async fn apply_new_target_uri(
                     media_id, media_mapping.original_media_id
                 );
                 orig_url = replace_id(orig_url, &media_id, &media_mapping.original_media_id);
+            } else if let Ok(Some(source)) = state
+                .library_management
+                .resolve_source_by_virtual_id_for_server(&media_id, server.id)
+                .await
+            {
+                debug!(
+                    "Replacing grouped library ID in path: {} -> {} for server {}",
+                    media_id, source.source_library_id, server.name
+                );
+                orig_url = replace_id(orig_url, &media_id, &source.source_library_id);
+            } else if let Ok(Some(preview)) = state
+                .library_management
+                .resolve_preview_source_by_virtual_id(&media_id)
+                .await
+            {
+                if preview.preview_server_id == server.id {
+                    debug!(
+                        "Replacing grouped preview library ID in path: {} -> {} for server {}",
+                        media_id, preview.preview_library_id, server.name
+                    );
+                    orig_url = replace_id(orig_url, &media_id, &preview.preview_library_id);
+                }
             }
         }
     }
@@ -440,6 +462,32 @@ pub async fn apply_new_target_uri(
                     );
                     resolved_ids.push(media_mapping.original_media_id);
                     changed = true;
+                } else if let Ok(Some(source)) = state
+                    .library_management
+                    .resolve_source_by_virtual_id_for_server(trimmed, server.id)
+                    .await
+                {
+                    debug!(
+                        "Replacing grouped library ID in query: {} -> {} for server {}",
+                        trimmed, source.source_library_id, server.name
+                    );
+                    resolved_ids.push(source.source_library_id);
+                    changed = true;
+                } else if let Ok(Some(preview)) = state
+                    .library_management
+                    .resolve_preview_source_by_virtual_id(trimmed)
+                    .await
+                {
+                    if preview.preview_server_id == server.id {
+                        debug!(
+                            "Replacing grouped preview ID in query: {} -> {} for server {}",
+                            trimmed, preview.preview_library_id, server.name
+                        );
+                        resolved_ids.push(preview.preview_library_id);
+                        changed = true;
+                    } else {
+                        resolved_ids.push(trimmed.to_string());
+                    }
                 } else {
                     resolved_ids.push(trimmed.to_string());
                 }
@@ -562,6 +610,15 @@ pub async fn resolve_server(
                 );
                 request_server = Some(server);
                 break; // Stop at first match
+            } else if let Some(group_server) =
+                resolve_group_server_for_virtual_id(state, sessions, &media_id).await
+            {
+                debug!(
+                    "Found grouped server for {} ID {}: {} ({})",
+                    path_segment, media_id, group_server.name, group_server.url
+                );
+                request_server = Some(group_server);
+                break;
             } else {
                 debug!("No server found for {} ID: {}", path_segment, media_id);
             }
@@ -578,19 +635,37 @@ pub async fn resolve_server(
                 .map(|(_, v)| v.to_string())
             {
                 debug!("Found {} in query: {}", param_name, param_value);
-                if let Some((_mapping, server)) = state
-                    .media_storage
-                    .get_media_mapping_with_server(&param_value)
-                    .await?
-                {
-                    debug!(
-                        "Found server for {} {}: {} ({})",
-                        param_name, param_value, server.name, server.url
-                    );
-                    request_server = Some(server);
-                    break; // Stop at first match
-                } else {
-                    debug!("No server found for {} : {}", param_name, param_value);
+                for raw_id in param_value.split(',') {
+                    let id = raw_id.trim();
+                    if id.is_empty() {
+                        continue;
+                    }
+
+                    if let Some((_mapping, server)) =
+                        state.media_storage.get_media_mapping_with_server(id).await?
+                    {
+                        debug!(
+                            "Found server for {} {}: {} ({})",
+                            param_name, id, server.name, server.url
+                        );
+                        request_server = Some(server);
+                        break;
+                    }
+
+                    if let Some(group_server) =
+                        resolve_group_server_for_virtual_id(state, sessions, id).await
+                    {
+                        debug!(
+                            "Found grouped server for {} {}: {} ({})",
+                            param_name, id, group_server.name, group_server.url
+                        );
+                        request_server = Some(group_server);
+                        break;
+                    }
+                }
+
+                if request_server.is_some() {
+                    break;
                 }
             }
         }
@@ -632,6 +707,41 @@ pub async fn resolve_server(
     let server = state.server_storage.get_best_server().await?;
     let server = server.ok_or_else(|| anyhow::anyhow!("No server available"))?;
     Ok((server, None))
+}
+
+async fn resolve_group_server_for_virtual_id(
+    state: &AppState,
+    sessions: &Option<Vec<(AuthorizationSession, Server)>>,
+    virtual_library_id: &str,
+) -> Option<Server> {
+    let group = match state
+        .library_management
+        .get_group_by_virtual_id_with_sources(virtual_library_id)
+        .await
+    {
+        Ok(Some(group)) => group,
+        _ => return None,
+    };
+
+    if let Some(sessions) = sessions {
+        for (_session, session_server) in sessions {
+            if group
+                .sources
+                .iter()
+                .any(|source| source.server_id == session_server.id)
+            {
+                return Some(session_server.clone());
+            }
+        }
+
+        return None;
+    }
+
+    state
+        .server_storage
+        .get_server_by_id(group.group.preview_server_id)
+        .await
+        .unwrap_or(None)
 }
 
 pub async fn get_user_from_request(

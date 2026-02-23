@@ -30,6 +30,7 @@ mod config;
 mod encryption;
 mod federated_users;
 mod handlers;
+mod library_management_service;
 mod media_storage_service;
 mod models;
 mod processors;
@@ -42,6 +43,7 @@ mod user_authorization_service;
 
 use federated_users::FederatedUserService;
 use handlers::syncplay::SyncPlayService;
+use library_management_service::LibraryManagementService;
 use media_storage_service::MediaStorageService;
 use server_storage::ServerStorageService;
 use user_authorization_service::UserAuthorizationService;
@@ -70,6 +72,7 @@ pub struct AppState {
     pub reqwest_client: reqwest::Client,
     pub user_authorization: Arc<UserAuthorizationService>,
     pub server_storage: Arc<ServerStorageService>,
+    pub library_management: Arc<LibraryManagementService>,
     pub media_storage: Arc<MediaStorageService>,
     pub play_sessions: Arc<SessionStorage>,
     pub config: Arc<tokio::sync::RwLock<AppConfig>>,
@@ -99,6 +102,7 @@ impl AppState {
             reqwest_client,
             user_authorization: data_context.user_authorization,
             server_storage: data_context.server_storage,
+            library_management: data_context.library_management,
             media_storage: data_context.media_storage,
             play_sessions: data_context.play_sessions,
             config: data_context.config,
@@ -158,6 +162,7 @@ impl AppState {
 pub struct DataContext {
     pub user_authorization: Arc<UserAuthorizationService>,
     pub server_storage: Arc<ServerStorageService>,
+    pub library_management: Arc<LibraryManagementService>,
     pub media_storage: Arc<MediaStorageService>,
     pub play_sessions: Arc<SessionStorage>,
     pub config: Arc<tokio::sync::RwLock<AppConfig>>,
@@ -236,6 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize media storage service
     let media_storage = MediaStorageService::new(pool.clone());
+    let library_management = LibraryManagementService::new(pool.clone());
 
     if !loaded_config.preconfigured_servers.is_empty() {
         info!(
@@ -285,6 +291,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_context = DataContext {
         user_authorization: Arc::new(user_authorization.clone()),
         server_storage: Arc::new(server_storage.clone()),
+        library_management: Arc::new(library_management.clone()),
         media_storage: Arc::new(media_storage.clone()),
         play_sessions: Arc::new(SessionStorage::new()),
         config: Arc::new(tokio::sync::RwLock::new(loaded_config.clone())),

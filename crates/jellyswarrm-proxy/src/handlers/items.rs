@@ -12,7 +12,10 @@ use crate::{
         execute_json_request, payload_from_request, process_media_item, process_media_source,
         track_play_session,
     },
-    models::{MediaItem, PlaybackRequest, PlaybackResponse},
+    models::{
+        enums::{BaseItemKind, CollectionType},
+        MediaItem, PlaybackRequest, PlaybackResponse,
+    },
     request_preprocessing::preprocess_request,
     AppState,
 };
@@ -29,19 +32,75 @@ pub async fn get_item(
     })?;
 
     let server = preprocessed.server;
+    let grouped_library_override = if let Some(original_request) = &preprocessed.original_request {
+        if let Some(requested_item_id) = extract_item_id_from_path(original_request.url().path()) {
+            match state
+                .library_management
+                .get_group_by_virtual_id_with_sources(&requested_item_id)
+                .await
+            {
+                Ok(Some(group)) => Some((
+                    requested_item_id,
+                    group.group.name,
+                    parse_collection_type(&group.group.collection_type),
+                )),
+                Ok(None) => None,
+                Err(e) => {
+                    error!(
+                        "Failed to load grouped library metadata for item override: {}",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     match execute_json_request::<MediaItem>(&state.reqwest_client, preprocessed.request).await {
         Ok(media_item) => {
             let server_id = { state.config.read().await.server_id.clone() };
-            Ok(Json(
-                process_media_item(media_item, &state, &server, false, &server_id).await?,
-            ))
+            let mut processed_item =
+                process_media_item(media_item, &state, &server, false, &server_id).await?;
+
+            if let Some((group_virtual_id, group_name, group_collection_type)) =
+                grouped_library_override
+            {
+                processed_item.id = group_virtual_id.clone();
+                processed_item.name = Some(group_name);
+                processed_item.collection_type = Some(group_collection_type);
+                processed_item.item_type = BaseItemKind::CollectionFolder;
+                processed_item.is_folder = Some(true);
+                processed_item.display_preferences_id = Some(group_virtual_id);
+            }
+
+            Ok(Json(processed_item))
         }
         Err(e) => {
             error!("Failed to get MediaItem: {:?}", e);
             Err(e)
         }
     }
+}
+
+fn parse_collection_type(value: &str) -> CollectionType {
+    serde_json::from_value::<CollectionType>(serde_json::Value::String(value.to_string()))
+        .unwrap_or_else(|_| CollectionType::UnknownVariant(value.to_string()))
+}
+
+fn extract_item_id_from_path(path: &str) -> Option<String> {
+    let segments: Vec<&str> = path.split('/').filter(|segment| !segment.is_empty()).collect();
+
+    for index in 0..segments.len() {
+        if segments[index].eq_ignore_ascii_case("items") && (index + 1) < segments.len() {
+            return Some(segments[index + 1].to_string());
+        }
+    }
+
+    None
 }
 
 //http://localhost:3000/Users/7bc57a386ab84999ad7262210a9cd253/Items?SortBy=SortName%2CProductionYear&SortOrder=Ascending&IncludeItemTypes=Movie&Recursive=true&Fields=PrimaryImageAspectRatio%2CMediaSourceCount&ImageTypeLimit=1&EnableImageTypes=Primary%2CBackdrop%2CBanner%2CThumb&StartIndex=0&ParentId=5f7e146c44d84b479cafecd3280be4ea&Limit=100

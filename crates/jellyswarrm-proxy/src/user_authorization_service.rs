@@ -764,6 +764,41 @@ impl UserAuthorizationService {
         Ok(sessions)
     }
 
+    /// Returns the most recently updated non-expired authorization session
+    /// for any user on the given server URL.
+    pub async fn get_latest_active_session_for_server(
+        &self,
+        server_url: &str,
+    ) -> Result<Option<AuthorizationSession>, sqlx::Error> {
+        sqlx::query_as::<_, AuthorizationSession>(
+            r#"
+            SELECT
+                id,
+                user_id,
+                mapping_id,
+                server_url,
+                client,
+                device,
+                device_id,
+                version,
+                jellyfin_token,
+                original_user_id,
+                expires_at,
+                created_at,
+                updated_at
+            FROM authorization_sessions
+            WHERE RTRIM(server_url, '/') = RTRIM(?, '/')
+              AND (expires_at IS NULL OR expires_at > ?)
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(server_url)
+        .bind(chrono::Utc::now())
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     /// List all users
     pub async fn list_users(&self) -> Result<Vec<User>, sqlx::Error> {
         let users = sqlx::query_as::<_, User>(
@@ -1998,5 +2033,92 @@ mod tests {
             .unwrap()
             .1;
         assert_eq!(sessions_after.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_active_session_for_server() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let service = UserAuthorizationService::new(pool.clone());
+
+        sqlx::query(
+            r#"
+            INSERT INTO servers (name, url, priority, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("Server 1")
+        .bind("http://localhost:8096")
+        .bind(100)
+        .bind(chrono::Utc::now())
+        .bind(chrono::Utc::now())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let user = service
+            .get_or_create_user("testuser", &"testpass".into())
+            .await
+            .unwrap();
+
+        service
+            .add_server_mapping(
+                &user.id,
+                "http://localhost:8096",
+                "mappeduser",
+                &"mappedpass".into(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let auth_1 = Authorization {
+            client: "Jellyfin Web".to_string(),
+            device: "Firefox".to_string(),
+            device_id: "device-1".to_string(),
+            version: "10.0.0".to_string(),
+            token: None,
+        };
+        service
+            .store_authorization_session(
+                &user.id,
+                "http://localhost:8096",
+                &auth_1,
+                "token-1".to_string(),
+                "orig-user-1".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let auth_2 = Authorization {
+            client: "Jellyfin Web".to_string(),
+            device: "Firefox".to_string(),
+            device_id: "device-2".to_string(),
+            version: "10.0.0".to_string(),
+            token: None,
+        };
+        service
+            .store_authorization_session(
+                &user.id,
+                "http://localhost:8096",
+                &auth_2,
+                "token-2".to_string(),
+                "orig-user-1".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let latest = service
+            .get_latest_active_session_for_server("http://localhost:8096/")
+            .await
+            .unwrap()
+            .expect("expected a latest active session");
+
+        assert_eq!(latest.jellyfin_token, "token-2");
+        assert_eq!(latest.device.device_id, "device-2");
     }
 }

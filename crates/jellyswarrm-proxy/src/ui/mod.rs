@@ -133,6 +133,18 @@ pub fn ui_routes() -> axum::Router<AppState> {
         .route("/settings/form", get(admin::settings::settings_form))
         .route("/settings/save", post(admin::settings::save_settings))
         .route("/settings/reload", post(admin::settings::reload_config))
+        // Libraries
+        .route("/libraries", get(admin::libraries::libraries_page))
+        .route("/libraries/list", get(admin::libraries::get_library_list))
+        .route("/libraries", post(admin::libraries::add_library))
+        .route(
+            "/libraries/{id}",
+            axum::routing::patch(admin::libraries::update_library),
+        )
+        .route(
+            "/libraries/{id}",
+            axum::routing::delete(admin::libraries::delete_library),
+        )
         .route_layer(middleware::from_fn(require_admin));
 
     Router::new()
