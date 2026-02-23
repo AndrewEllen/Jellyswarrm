@@ -20,7 +20,7 @@ use crate::{
     media_storage_service::MediaDedupeMember,
     models::{
         enums::{BaseItemKind, CollectionType},
-        ItemsResponseVariants, ItemsResponseWithCount, MediaItem,
+        ItemsResponseVariants, ItemsResponseWithCount, MediaItem, UserData,
     },
     request_preprocessing::{apply_to_request, extract_request_infos, JellyfinAuthorization},
     server_storage::Server,
@@ -92,8 +92,9 @@ pub async fn get_items_from_all_servers(
         })
         .collect();
 
+    let sort_options = sort_options_from_url(original_request.url());
     let server_items = fetch_items_parallel(&state, &original_request, targets).await;
-    let merged = merge_server_item_batches(&state, server_items).await;
+    let merged = merge_server_item_batches(&state, server_items, sort_options.as_ref()).await;
     Ok(Json(merged))
 }
 
@@ -151,8 +152,9 @@ async fn get_items_from_grouped_parent(
         })));
     }
 
+    let sort_options = sort_options_from_url(original_request.url());
     let server_items = fetch_items_parallel(&state, &original_request, targets).await;
-    let merged = merge_server_item_batches(&state, server_items).await;
+    let merged = merge_server_item_batches(&state, server_items, sort_options.as_ref()).await;
     Ok(Json(merged))
 }
 
@@ -322,6 +324,7 @@ async fn fetch_items_for_target(
 pub(crate) async fn merge_server_item_batches(
     state: &AppState,
     server_items: Vec<ServerItemsBatch>,
+    sort_options: Option<&SortOptions>,
 ) -> ItemsResponseVariants {
     let with_count = server_items
         .iter()
@@ -336,7 +339,8 @@ pub(crate) async fn merge_server_item_batches(
         .sum();
 
     let interleaved_items = interleave_items_with_servers(server_items);
-    let deduped_items = dedupe_interleaved_items(state, interleaved_items).await;
+    let mut deduped_items = dedupe_interleaved_items(state, interleaved_items).await;
+    apply_sort_options(&mut deduped_items, sort_options);
 
     if with_count {
         ItemsResponseVariants::WithCount(ItemsResponseWithCount {
@@ -419,6 +423,21 @@ struct DedupedItemEntry {
     members: HashMap<i64, String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SortOptions {
+    pub fields: Vec<SortField>,
+    pub descending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SortField {
+    SortName,
+    Name,
+    ProductionYear,
+    DateCreated,
+    PremiereDate,
+}
+
 fn interleave_items_with_servers(server_items: Vec<ServerItemsBatch>) -> Vec<InterleavedItemWithServer> {
     let mut interleaved_items = Vec::new();
     let mut live_tv_count = 0;
@@ -478,7 +497,15 @@ async fn dedupe_interleaved_items(
             if server.priority > existing.canonical_priority {
                 existing.canonical_priority = server.priority;
                 existing.canonical_id = item.id.clone();
+                let merged_user_data =
+                    merge_user_data(deduped_items[existing.output_index].user_data.clone(), item.user_data.clone());
                 deduped_items[existing.output_index] = item;
+                deduped_items[existing.output_index].user_data = merged_user_data;
+            } else {
+                deduped_items[existing.output_index].user_data = merge_user_data(
+                    deduped_items[existing.output_index].user_data.clone(),
+                    item.user_data.clone(),
+                );
             }
             continue;
         }
@@ -520,6 +547,41 @@ async fn dedupe_interleaved_items(
     }
 
     deduped_items
+}
+
+fn merge_user_data(existing: Option<UserData>, incoming: Option<UserData>) -> Option<UserData> {
+    match (existing, incoming) {
+        (None, None) => None,
+        (Some(existing), None) => Some(existing),
+        (None, Some(incoming)) => Some(incoming),
+        (Some(mut existing), Some(incoming)) => {
+            existing.played = existing.played || incoming.played;
+            existing.is_favorite = existing.is_favorite || incoming.is_favorite;
+            existing.play_count = existing.play_count.max(incoming.play_count);
+            existing.playback_position_ticks = existing
+                .playback_position_ticks
+                .max(incoming.playback_position_ticks);
+            existing.unplayed_item_count = match (existing.unplayed_item_count, incoming.unplayed_item_count) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            existing.played_percentage = match (existing.played_percentage, incoming.played_percentage) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            existing.last_played_date = match (existing.last_played_date, incoming.last_played_date) {
+                (Some(a), Some(b)) => Some(if b > a { b } else { a }),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            Some(existing)
+        }
+    }
 }
 
 fn build_media_dedupe_key(item: &MediaItem) -> Option<String> {
@@ -626,6 +688,117 @@ fn normalize_opt_string(input: Option<&str>) -> Option<String> {
     }
 
     Some(input.to_ascii_lowercase())
+}
+
+pub(crate) fn sort_options_from_url(url: &url::Url) -> Option<SortOptions> {
+    let sort_by_raw = url
+        .query_pairs()
+        .find(|(key, _)| key.eq_ignore_ascii_case("SortBy"))
+        .map(|(_, value)| value.to_string())?;
+
+    let fields = sort_by_raw
+        .split(',')
+        .filter_map(|raw| match raw.trim().to_ascii_lowercase().as_str() {
+            "sortname" => Some(SortField::SortName),
+            "name" => Some(SortField::Name),
+            "productionyear" => Some(SortField::ProductionYear),
+            "datecreated" => Some(SortField::DateCreated),
+            "premieredate" => Some(SortField::PremiereDate),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if fields.is_empty() {
+        return None;
+    }
+
+    let descending = url
+        .query_pairs()
+        .find(|(key, _)| key.eq_ignore_ascii_case("SortOrder"))
+        .map(|(_, value)| value.eq_ignore_ascii_case("descending"))
+        .unwrap_or(false);
+
+    Some(SortOptions { fields, descending })
+}
+
+fn apply_sort_options(items: &mut Vec<MediaItem>, sort_options: Option<&SortOptions>) {
+    let Some(sort_options) = sort_options else {
+        return;
+    };
+    if sort_options.fields.is_empty() {
+        return;
+    }
+
+    let mut indexed = items
+        .drain(..)
+        .enumerate()
+        .collect::<Vec<(usize, MediaItem)>>();
+
+    indexed.sort_by(|(a_index, a_item), (b_index, b_item)| {
+        for field in &sort_options.fields {
+            let ordering = compare_media_item_field(a_item, b_item, *field);
+            if ordering != std::cmp::Ordering::Equal {
+                return if sort_options.descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                };
+            }
+        }
+        a_index.cmp(b_index)
+    });
+
+    *items = indexed.into_iter().map(|(_, item)| item).collect();
+}
+
+fn compare_media_item_field(a: &MediaItem, b: &MediaItem, field: SortField) -> std::cmp::Ordering {
+    match field {
+        SortField::SortName => compare_optional_text(
+            a.sort_name
+                .as_deref()
+                .or(a.name.as_deref())
+                .or(a.original_title.as_deref()),
+            b.sort_name
+                .as_deref()
+                .or(b.name.as_deref())
+                .or(b.original_title.as_deref()),
+        ),
+        SortField::Name => compare_optional_text(a.name.as_deref(), b.name.as_deref()),
+        SortField::ProductionYear => compare_optional_i64(
+            extract_i64_field(a, "ProductionYear"),
+            extract_i64_field(b, "ProductionYear"),
+        ),
+        SortField::DateCreated => compare_optional_text(a.date_created.as_deref(), b.date_created.as_deref()),
+        SortField::PremiereDate => compare_optional_text(
+            extract_string_field(a, "PremiereDate").as_deref(),
+            extract_string_field(b, "PremiereDate").as_deref(),
+        ),
+    }
+}
+
+fn compare_optional_text(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn compare_optional_i64(a: Option<i64>, b: Option<i64>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn extract_string_field(item: &MediaItem, field_name: &str) -> Option<String> {
+    item.extra
+        .iter()
+        .find_map(|(key, value)| key.eq_ignore_ascii_case(field_name).then_some(value))
+        .and_then(|value| value.as_str().map(|s| s.to_string()))
 }
 
 fn is_user_views_request(path: &str) -> bool {

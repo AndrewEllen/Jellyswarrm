@@ -16,11 +16,12 @@ use crate::{
             execute_json_request, payload_from_request, process_media_item, process_media_source,
             track_play_session,
         },
-        federated::{merge_server_item_batches, ServerItemsBatch},
+        federated::{merge_server_item_batches, sort_options_from_url, ServerItemsBatch},
     },
     models::{
         enums::{BaseItemKind, CollectionType},
-        ItemsResponseVariants, ItemsResponseWithCount, MediaItem, PlaybackRequest, PlaybackResponse,
+        ItemsResponseVariants, ItemsResponseWithCount, MediaItem, MediaSource, PlaybackRequest,
+        PlaybackResponse, UserData,
     },
     request_preprocessing::{
         apply_to_request, extract_request_infos, preprocess_request, JellyfinAuthorization,
@@ -42,34 +43,52 @@ pub async fn get_item(
         StatusCode::BAD_REQUEST
     })?;
 
-    let server = preprocessed.server;
-    let grouped_library_override = if let Some(original_request) = &preprocessed.original_request {
-        if let Some(requested_item_id) = extract_item_id_from_path(original_request.url().path()) {
-            match state
-                .library_management
-                .get_group_by_virtual_id_with_sources(&requested_item_id)
-                .await
-            {
-                Ok(Some(group)) => Some((
-                    requested_item_id,
-                    group.group.name,
-                    parse_collection_type(&group.group.collection_type),
-                )),
-                Ok(None) => None,
-                Err(e) => {
-                    error!(
-                        "Failed to load grouped library metadata for item override: {}",
-                        e
-                    );
-                    None
-                }
+    let server = preprocessed.server.clone();
+    let requested_item_id = preprocessed
+        .original_request
+        .as_ref()
+        .and_then(|request| extract_item_id_from_path(request.url().path()));
+
+    let grouped_library_override = if let Some(requested_item_id) = requested_item_id.clone() {
+        match state
+            .library_management
+            .get_group_by_virtual_id_with_sources(&requested_item_id)
+            .await
+        {
+            Ok(Some(group)) => Some((
+                requested_item_id,
+                group.group.name,
+                parse_collection_type(&group.group.collection_type),
+            )),
+            Ok(None) => None,
+            Err(e) => {
+                error!(
+                    "Failed to load grouped library metadata for item override: {}",
+                    e
+                );
+                None
             }
-        } else {
-            None
         }
     } else {
         None
     };
+
+    if let Some(requested_item_id) = requested_item_id.as_deref() {
+        if let Some(mut grouped_item) =
+            try_get_grouped_item_with_sources(&state, &preprocessed, requested_item_id).await?
+        {
+            if let Some((group_virtual_id, group_name, group_collection_type)) = grouped_library_override {
+                grouped_item.id = group_virtual_id.clone();
+                grouped_item.name = Some(group_name);
+                grouped_item.collection_type = Some(group_collection_type);
+                grouped_item.item_type = BaseItemKind::CollectionFolder;
+                grouped_item.is_folder = Some(true);
+                grouped_item.display_preferences_id = Some(group_virtual_id);
+            }
+
+            return Ok(Json(grouped_item));
+        }
+    }
 
     match execute_json_request::<MediaItem>(&state.reqwest_client, preprocessed.request).await {
         Ok(media_item) => {
@@ -259,7 +278,8 @@ async fn get_show_items_with_optional_dedupe(
         .map(|(_, batch)| batch)
         .collect::<Vec<_>>();
 
-    let merged = merge_server_item_batches(&state, batches).await;
+    let sort_options = sort_options_from_url(original_request.url());
+    let merged = merge_server_item_batches(&state, batches, sort_options.as_ref()).await;
     Ok(Json(merged))
 }
 
@@ -595,4 +615,159 @@ fn extract_query_parameter(url: &url::Url, parameter_name: &str) -> Option<Strin
                 Some(trimmed.to_string())
             }
         })
+}
+
+async fn try_get_grouped_item_with_sources(
+    state: &AppState,
+    preprocessed: &crate::request_preprocessing::PreprocessedRequest,
+    requested_item_id: &str,
+) -> Result<Option<MediaItem>, StatusCode> {
+    let Some(group) = state.media_storage.get_media_dedupe_group(requested_item_id).await else {
+        return Ok(None);
+    };
+    if group.members.len() < 2 {
+        return Ok(None);
+    }
+
+    let Some(original_request) = preprocessed.original_request.as_ref() else {
+        return Ok(None);
+    };
+    let Some(sessions) = preprocessed.sessions.clone() else {
+        return Ok(None);
+    };
+
+    let mut sessions_by_server: HashMap<i64, (AuthorizationSession, Server)> = HashMap::new();
+    for (session, server) in sessions {
+        sessions_by_server.entry(server.id).or_insert((session, server));
+    }
+
+    let mut candidates = group
+        .members
+        .iter()
+        .filter_map(|member| {
+            sessions_by_server
+                .get(&member.server_id)
+                .map(|(session, server)| (member.virtual_media_id.clone(), session.clone(), server.clone()))
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|a, b| {
+        b.2.priority
+            .cmp(&a.2.priority)
+            .then_with(|| a.2.name.cmp(&b.2.name))
+    });
+
+    let server_id = { state.config.read().await.server_id.clone() };
+    let mut canonical_item: Option<(i32, String, MediaItem)> = None;
+    let mut merged_sources: Vec<MediaSource> = Vec::new();
+    let mut merged_user_data: Option<UserData> = None;
+    let mut seen_source_ids = std::collections::HashSet::new();
+
+    for (item_virtual_id, session, server) in candidates {
+        let Some(mut request) = original_request.try_clone() else {
+            continue;
+        };
+        replace_item_id_for_request(&mut request, &item_virtual_id);
+
+        let auth = Some(JellyfinAuthorization::Authorization(session.to_authorization()));
+        apply_to_request(
+            &mut request,
+            &server,
+            &Some(session),
+            &auth,
+            state,
+        )
+        .await;
+
+        let response_item =
+            match execute_json_request::<MediaItem>(&state.reqwest_client, request).await {
+                Ok(item) => item,
+                Err(status) => {
+                    error!(
+                        "Failed to fetch grouped item details from server '{}': {}",
+                        server.name, status
+                    );
+                    continue;
+                }
+            };
+
+        let mut processed_item =
+            process_media_item(response_item, state, &server, false, &server_id).await?;
+
+        merged_user_data = merge_user_data(merged_user_data, processed_item.user_data.clone());
+
+        if let Some(media_sources) = processed_item.media_sources.take() {
+            for mut source in media_sources {
+                if !seen_source_ids.insert(source.id.clone()) {
+                    continue;
+                }
+                source.name = Some(match source.name.as_deref() {
+                    Some(existing) if !existing.trim().is_empty() => {
+                        format!("{existing} [{}]", server.name)
+                    }
+                    _ => format!("{} source", server.name),
+                });
+                merged_sources.push(source);
+            }
+        }
+
+        let should_replace_canonical = canonical_item
+            .as_ref()
+            .map(|(priority, name, _)| {
+                (server.priority > *priority)
+                    || (server.priority == *priority && server.name.to_ascii_lowercase() < name.to_ascii_lowercase())
+            })
+            .unwrap_or(true);
+
+        if should_replace_canonical {
+            canonical_item = Some((server.priority, server.name.clone(), processed_item));
+        }
+    }
+
+    let Some((_, _, mut canonical_item)) = canonical_item else {
+        return Ok(None);
+    };
+
+    if !merged_sources.is_empty() {
+        canonical_item.media_sources = Some(merged_sources);
+    }
+    canonical_item.user_data = merge_user_data(canonical_item.user_data, merged_user_data);
+    canonical_item.id = requested_item_id.to_string();
+
+    Ok(Some(canonical_item))
+}
+
+fn merge_user_data(existing: Option<UserData>, incoming: Option<UserData>) -> Option<UserData> {
+    match (existing, incoming) {
+        (None, None) => None,
+        (Some(existing), None) => Some(existing),
+        (None, Some(incoming)) => Some(incoming),
+        (Some(mut existing), Some(incoming)) => {
+            existing.played = existing.played || incoming.played;
+            existing.is_favorite = existing.is_favorite || incoming.is_favorite;
+            existing.play_count = existing.play_count.max(incoming.play_count);
+            existing.playback_position_ticks = existing
+                .playback_position_ticks
+                .max(incoming.playback_position_ticks);
+            existing.unplayed_item_count = match (existing.unplayed_item_count, incoming.unplayed_item_count) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            existing.played_percentage = match (existing.played_percentage, incoming.played_percentage) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            existing.last_played_date = match (existing.last_played_date, incoming.last_played_date) {
+                (Some(a), Some(b)) => Some(if b > a { b } else { a }),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            Some(existing)
+        }
+    }
 }
