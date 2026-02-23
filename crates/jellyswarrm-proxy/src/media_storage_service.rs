@@ -8,6 +8,18 @@ use crate::models::generate_token;
 use crate::server_storage::Server;
 use moka::future::Cache;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaDedupeMember {
+    pub server_id: i64,
+    pub virtual_media_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaDedupeGroup {
+    pub canonical_virtual_media_id: String,
+    pub members: Vec<MediaDedupeMember>,
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct MediaMapping {
     pub id: i64,
@@ -22,6 +34,8 @@ pub struct MediaStorageService {
     pool: SqlitePool,
     original_mapping_cache: Cache<String, MediaMapping>,
     mapping_with_server_cache: Cache<String, (MediaMapping, Server)>,
+    dedupe_group_cache: Cache<String, MediaDedupeGroup>,
+    dedupe_member_index_cache: Cache<String, String>,
 }
 
 impl MediaStorageService {
@@ -36,7 +50,107 @@ impl MediaStorageService {
                 .time_to_live(Duration::from_secs(60 * 30))
                 .max_capacity(10_000)
                 .build(),
+            dedupe_group_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(60 * 60 * 6))
+                .max_capacity(100_000)
+                .build(),
+            dedupe_member_index_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(60 * 60 * 6))
+                .max_capacity(500_000)
+                .build(),
         }
+    }
+
+    pub async fn register_media_dedupe_group(
+        &self,
+        canonical_virtual_media_id: &str,
+        members: Vec<MediaDedupeMember>,
+    ) {
+        if members.is_empty() {
+            return;
+        }
+
+        let canonical_virtual_media_id = Self::normalize_uuid(canonical_virtual_media_id);
+
+        let mut deduped_members = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for member in members {
+            let normalized_virtual_id = Self::normalize_uuid(&member.virtual_media_id);
+            let key = (member.server_id, normalized_virtual_id.clone());
+            if !seen.insert(key) {
+                continue;
+            }
+
+            deduped_members.push(MediaDedupeMember {
+                server_id: member.server_id,
+                virtual_media_id: normalized_virtual_id,
+            });
+        }
+
+        if deduped_members.is_empty() {
+            return;
+        }
+
+        if let Some(existing) = self.dedupe_group_cache.get(&canonical_virtual_media_id).await {
+            for member in existing.members {
+                self.dedupe_member_index_cache
+                    .invalidate(&member.virtual_media_id)
+                    .await;
+            }
+        }
+
+        for member in &deduped_members {
+            self.dedupe_member_index_cache
+                .insert(
+                    member.virtual_media_id.clone(),
+                    canonical_virtual_media_id.clone(),
+                )
+                .await;
+        }
+
+        self.dedupe_member_index_cache
+            .insert(
+                canonical_virtual_media_id.clone(),
+                canonical_virtual_media_id.clone(),
+            )
+            .await;
+
+        self.dedupe_group_cache
+            .insert(
+                canonical_virtual_media_id.clone(),
+                MediaDedupeGroup {
+                    canonical_virtual_media_id,
+                    members: deduped_members,
+                },
+            )
+            .await;
+    }
+
+    pub async fn get_media_dedupe_group(
+        &self,
+        media_virtual_id: &str,
+    ) -> Option<MediaDedupeGroup> {
+        let media_virtual_id = Self::normalize_uuid(media_virtual_id);
+
+        if let Some(canonical_virtual_id) = self.dedupe_member_index_cache.get(&media_virtual_id).await
+        {
+            return self.dedupe_group_cache.get(&canonical_virtual_id).await;
+        }
+
+        self.dedupe_group_cache.get(&media_virtual_id).await
+    }
+
+    pub async fn get_media_dedupe_member_for_server(
+        &self,
+        media_virtual_id: &str,
+        server_id: i64,
+    ) -> Option<String> {
+        let group = self.get_media_dedupe_group(media_virtual_id).await?;
+        group
+            .members
+            .iter()
+            .find(|member| member.server_id == server_id)
+            .map(|member| member.virtual_media_id.clone())
     }
 
     /// Create or get a media mapping
@@ -258,6 +372,7 @@ impl MediaStorageService {
             self.mapping_with_server_cache
                 .invalidate(virtual_media_id)
                 .await;
+            self.dedupe_member_index_cache.invalidate(virtual_media_id).await;
             info!("Deleted media mapping: {}", virtual_media_id);
             Ok(true)
         } else {
@@ -288,6 +403,8 @@ impl MediaStorageService {
         }
         self.original_mapping_cache.invalidate_all();
         self.mapping_with_server_cache.invalidate_all();
+        self.dedupe_group_cache.invalidate_all();
+        self.dedupe_member_index_cache.invalidate_all();
         Ok(deleted_count)
     }
 }
@@ -418,5 +535,49 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_media_dedupe_group_cache() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let service = MediaStorageService::new(pool);
+
+        service
+            .register_media_dedupe_group(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                vec![
+                    MediaDedupeMember {
+                        server_id: 1,
+                        virtual_media_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                    },
+                    MediaDedupeMember {
+                        server_id: 2,
+                        virtual_media_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                    },
+                ],
+            )
+            .await;
+
+        let by_canonical = service
+            .get_media_dedupe_group("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .await
+            .unwrap();
+        assert_eq!(by_canonical.members.len(), 2);
+
+        let by_member = service
+            .get_media_dedupe_group("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .await
+            .unwrap();
+        assert_eq!(
+            by_member.canonical_virtual_media_id,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        let member_server_2 = service
+            .get_media_dedupe_member_for_server("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 2)
+            .await
+            .unwrap();
+        assert_eq!(member_server_2, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     }
 }

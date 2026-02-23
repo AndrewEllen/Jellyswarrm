@@ -17,6 +17,7 @@ use crate::{
         common::{execute_json_request, process_media_item},
         items::get_items,
     },
+    media_storage_service::MediaDedupeMember,
     models::{
         enums::{BaseItemKind, CollectionType},
         ItemsResponseVariants, ItemsResponseWithCount, MediaItem,
@@ -92,7 +93,7 @@ pub async fn get_items_from_all_servers(
         .collect();
 
     let server_items = fetch_items_parallel(&state, &original_request, targets).await;
-    let merged = merge_server_items_interleaved(server_items);
+    let merged = merge_server_item_batches(&state, server_items).await;
     Ok(Json(merged))
 }
 
@@ -151,7 +152,7 @@ async fn get_items_from_grouped_parent(
     }
 
     let server_items = fetch_items_parallel(&state, &original_request, targets).await;
-    let merged = merge_server_items_interleaved(server_items);
+    let merged = merge_server_item_batches(&state, server_items).await;
     Ok(Json(merged))
 }
 
@@ -208,11 +209,17 @@ struct FederatedTarget {
     parent_override: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ServerItemsBatch {
+    pub server: Server,
+    pub items: ItemsResponseVariants,
+}
+
 async fn fetch_items_parallel(
     state: &AppState,
     original_request: &reqwest::Request,
     targets: Vec<FederatedTarget>,
-) -> Vec<ItemsResponseVariants> {
+) -> Vec<ServerItemsBatch> {
     let mut join_set = JoinSet::new();
 
     for target in targets {
@@ -234,7 +241,7 @@ async fn fetch_items_parallel(
         });
     }
 
-    let mut indexed_results: Vec<(usize, Option<ItemsResponseVariants>)> = Vec::new();
+    let mut indexed_results: Vec<(usize, Option<ServerItemsBatch>)> = Vec::new();
     while let Some(result) = join_set.join_next().await {
         match result {
             Ok((index, items)) => indexed_results.push((index, items)),
@@ -253,7 +260,7 @@ async fn fetch_items_for_target(
     state: AppState,
     mut request: reqwest::Request,
     target: FederatedTarget,
-) -> Option<ItemsResponseVariants> {
+) -> Option<ServerItemsBatch> {
     let auth = JellyfinAuthorization::Authorization(target.session.to_authorization());
     apply_to_request(
         &mut request,
@@ -306,7 +313,40 @@ async fn fetch_items_for_target(
         serde_json::to_string(&response).unwrap_or_default()
     );
 
-    Some(response)
+    Some(ServerItemsBatch {
+        server: target.server,
+        items: response,
+    })
+}
+
+pub(crate) async fn merge_server_item_batches(
+    state: &AppState,
+    server_items: Vec<ServerItemsBatch>,
+) -> ItemsResponseVariants {
+    let with_count = server_items
+        .iter()
+        .any(|items| matches!(&items.items, ItemsResponseVariants::WithCount(_)));
+
+    let total_record_count: i32 = server_items
+        .iter()
+        .map(|items| match &items.items {
+            ItemsResponseVariants::WithCount(response) => response.total_record_count,
+            ItemsResponseVariants::Bare(items) => items.len() as i32,
+        })
+        .sum();
+
+    let interleaved_items = interleave_items_with_servers(server_items);
+    let deduped_items = dedupe_interleaved_items(state, interleaved_items).await;
+
+    if with_count {
+        ItemsResponseVariants::WithCount(ItemsResponseWithCount {
+            items: deduped_items,
+            total_record_count,
+            start_index: 0,
+        })
+    } else {
+        ItemsResponseVariants::Bare(deduped_items)
+    }
 }
 
 fn merge_server_items_interleaved(server_items: Vec<ItemsResponseVariants>) -> ItemsResponseVariants {
@@ -363,6 +403,229 @@ fn merge_server_items_interleaved(server_items: Vec<ItemsResponseVariants>) -> I
     } else {
         ItemsResponseVariants::Bare(interleaved_items)
     }
+}
+
+#[derive(Debug, Clone)]
+struct InterleavedItemWithServer {
+    item: MediaItem,
+    server: Server,
+}
+
+#[derive(Debug, Clone)]
+struct DedupedItemEntry {
+    output_index: usize,
+    canonical_id: String,
+    canonical_priority: i32,
+    members: HashMap<i64, String>,
+}
+
+fn interleave_items_with_servers(server_items: Vec<ServerItemsBatch>) -> Vec<InterleavedItemWithServer> {
+    let mut interleaved_items = Vec::new();
+    let mut live_tv_count = 0;
+    let max_items = server_items
+        .iter()
+        .map(|server_items| server_items.items.len())
+        .max()
+        .unwrap_or(0);
+
+    for i in 0..max_items {
+        for server_item_list in &server_items {
+            if let Some(item) = server_item_list.items.get(i) {
+                if let Some(collectiontype) = &item.collection_type {
+                    if *collectiontype == CollectionType::LiveTv
+                        && item.item_type == BaseItemKind::UserView
+                    {
+                        live_tv_count += 1;
+                        if live_tv_count > 1 {
+                            continue;
+                        }
+                    }
+                }
+
+                interleaved_items.push(InterleavedItemWithServer {
+                    item: item.clone(),
+                    server: server_item_list.server.clone(),
+                });
+            }
+        }
+    }
+
+    interleaved_items
+}
+
+async fn dedupe_interleaved_items(
+    state: &AppState,
+    interleaved_items: Vec<InterleavedItemWithServer>,
+) -> Vec<MediaItem> {
+    let mut deduped_items: Vec<MediaItem> = Vec::new();
+    let mut entries_by_key: HashMap<String, DedupedItemEntry> = HashMap::new();
+
+    for interleaved in interleaved_items {
+        let item = interleaved.item;
+        let server = interleaved.server;
+
+        let Some(dedupe_key) = build_media_dedupe_key(&item) else {
+            deduped_items.push(item);
+            continue;
+        };
+
+        if let Some(existing) = entries_by_key.get_mut(&dedupe_key) {
+            existing
+                .members
+                .entry(server.id)
+                .or_insert_with(|| item.id.clone());
+
+            if server.priority > existing.canonical_priority {
+                existing.canonical_priority = server.priority;
+                existing.canonical_id = item.id.clone();
+                deduped_items[existing.output_index] = item;
+            }
+            continue;
+        }
+
+        let output_index = deduped_items.len();
+        let mut members = HashMap::new();
+        members.insert(server.id, item.id.clone());
+        entries_by_key.insert(
+            dedupe_key,
+            DedupedItemEntry {
+                output_index,
+                canonical_id: item.id.clone(),
+                canonical_priority: server.priority,
+                members,
+            },
+        );
+
+        deduped_items.push(item);
+    }
+
+    for entry in entries_by_key.into_values() {
+        if entry.members.len() <= 1 {
+            continue;
+        }
+
+        let members = entry
+            .members
+            .into_iter()
+            .map(|(server_id, virtual_media_id)| MediaDedupeMember {
+                server_id,
+                virtual_media_id,
+            })
+            .collect::<Vec<_>>();
+
+        state
+            .media_storage
+            .register_media_dedupe_group(&entry.canonical_id, members)
+            .await;
+    }
+
+    deduped_items
+}
+
+fn build_media_dedupe_key(item: &MediaItem) -> Option<String> {
+    let kind = normalize_item_kind(&item.item_type);
+    if !matches!(
+        item.item_type,
+        BaseItemKind::Movie
+            | BaseItemKind::Video
+            | BaseItemKind::Series
+            | BaseItemKind::Season
+            | BaseItemKind::Episode
+            | BaseItemKind::BoxSet
+            | BaseItemKind::CollectionFolder
+            | BaseItemKind::Trailer
+    ) {
+        return None;
+    }
+
+    if let Some(provider_key) = provider_ids_key(item) {
+        return Some(format!("provider|{kind}|{provider_key}"));
+    }
+
+    match item.item_type {
+        BaseItemKind::Episode => {
+            let series = normalize_opt_string(item.series_name.as_deref());
+            let season_number = extract_i64_field(item, "ParentIndexNumber");
+            let episode_number = extract_i64_field(item, "IndexNumber");
+            if let (Some(series), Some(season), Some(episode)) = (series, season_number, episode_number)
+            {
+                return Some(format!("episode|{series}|{season}|{episode}"));
+            }
+        }
+        BaseItemKind::Season => {
+            let series = normalize_opt_string(item.series_name.as_deref());
+            let season_number = extract_i64_field(item, "IndexNumber");
+            if let (Some(series), Some(season)) = (series, season_number) {
+                return Some(format!("season|{series}|{season}"));
+            }
+        }
+        _ => {}
+    }
+
+    let name = normalize_opt_string(item.name.as_deref())
+        .or_else(|| normalize_opt_string(item.original_title.as_deref()))?;
+    let year = extract_i64_field(item, "ProductionYear")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "na".to_string());
+    Some(format!("nameyear|{kind}|{name}|{year}"))
+}
+
+fn provider_ids_key(item: &MediaItem) -> Option<String> {
+    let serde_json::Value::Object(provider_obj) = item.provider_ids.as_ref()? else {
+        return None;
+    };
+
+    let mut pairs = provider_obj
+        .iter()
+        .filter_map(|(raw_key, raw_value)| {
+            let key = normalize_opt_string(Some(raw_key.as_str()))?;
+            let value = match raw_value {
+                serde_json::Value::String(s) => normalize_opt_string(Some(s.as_str()))?,
+                serde_json::Value::Number(n) => n.to_string(),
+                _ => return None,
+            };
+            if value.is_empty() {
+                return None;
+            }
+            Some(format!("{key}={value}"))
+        })
+        .collect::<Vec<_>>();
+
+    if pairs.is_empty() {
+        return None;
+    }
+
+    pairs.sort();
+    Some(pairs.join("|"))
+}
+
+fn extract_i64_field(item: &MediaItem, field_name: &str) -> Option<i64> {
+    let value = item
+        .extra
+        .iter()
+        .find_map(|(key, value)| key.eq_ignore_ascii_case(field_name).then_some(value))?;
+
+    match value {
+        serde_json::Value::Number(n) => n.as_i64(),
+        serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn normalize_item_kind(kind: &BaseItemKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(|s| s.to_ascii_lowercase()))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn normalize_opt_string(input: Option<&str>) -> Option<String> {
+    let input = input?.trim();
+    if input.is_empty() {
+        return None;
+    }
+
+    Some(input.to_ascii_lowercase())
 }
 
 fn is_user_views_request(path: &str) -> bool {
@@ -567,5 +830,34 @@ mod tests {
             }
             ItemsResponseVariants::Bare(_) => panic!("Expected WithCount response"),
         }
+    }
+
+    #[test]
+    fn test_build_media_dedupe_key_prefers_provider_ids() {
+        let mut item = build_grouped_user_view_item("a1", "Test Movie", "movies", "srv", 1);
+        item.item_type = BaseItemKind::Movie;
+        item.provider_ids = Some(serde_json::json!({
+            "Tmdb": "123",
+            "Imdb": "tt123"
+        }));
+
+        let key = build_media_dedupe_key(&item).unwrap();
+        assert!(key.contains("provider|movie|"));
+        assert!(key.contains("imdb=tt123"));
+        assert!(key.contains("tmdb=123"));
+    }
+
+    #[test]
+    fn test_build_media_dedupe_key_episode_fallback() {
+        let mut item = build_grouped_user_view_item("e1", "Pilot", "tvshows", "srv", 1);
+        item.item_type = BaseItemKind::Episode;
+        item.series_name = Some("Example Show".to_string());
+        item.extra
+            .insert("ParentIndexNumber".to_string(), serde_json::json!(1));
+        item.extra
+            .insert("IndexNumber".to_string(), serde_json::json!(2));
+
+        let key = build_media_dedupe_key(&item).unwrap();
+        assert_eq!(key, "episode|example show|1|2");
     }
 }

@@ -367,18 +367,38 @@ pub async fn apply_new_target_uri(
     // Process media IDs in the path
     for &path_segment in MEDIA_ID_PATH_TAGS {
         if let Some(media_id) = contains_id(&orig_url, path_segment) {
-            if let Some(media_mapping) = state
-                .media_storage
-                .get_media_mapping_by_virtual(&media_id)
-                .await
-                .unwrap_or_default()
-            {
-                debug!(
-                    "Replacing media ID in path: {} -> {}",
-                    media_id, media_mapping.original_media_id
-                );
-                orig_url = replace_id(orig_url, &media_id, &media_mapping.original_media_id);
-            } else if let Ok(Some(source)) = state
+            let mut resolved_media_virtual_id = media_id.clone();
+            let mut can_map_media_id = true;
+
+            if let Some(dedupe_group) = state.media_storage.get_media_dedupe_group(&media_id).await {
+                if let Some(member_for_server) = dedupe_group
+                    .members
+                    .iter()
+                    .find(|member| member.server_id == server.id)
+                {
+                    resolved_media_virtual_id = member_for_server.virtual_media_id.clone();
+                } else {
+                    can_map_media_id = false;
+                }
+            }
+
+            if can_map_media_id {
+                if let Some(media_mapping) = state
+                    .media_storage
+                    .get_media_mapping_by_virtual(&resolved_media_virtual_id)
+                    .await
+                    .unwrap_or_default()
+                {
+                    debug!(
+                        "Replacing media ID in path: {} (resolved {}) -> {}",
+                        media_id, resolved_media_virtual_id, media_mapping.original_media_id
+                    );
+                    orig_url = replace_id(orig_url, &media_id, &media_mapping.original_media_id);
+                    continue;
+                }
+            }
+
+            if let Ok(Some(source)) = state
                 .library_management
                 .resolve_source_by_virtual_id_for_server(&media_id, server.id)
                 .await
@@ -450,19 +470,39 @@ pub async fn apply_new_target_uri(
                     continue;
                 }
 
-                if let Some(media_mapping) = state
-                    .media_storage
-                    .get_media_mapping_by_virtual(trimmed)
-                    .await
-                    .unwrap_or_default()
-                {
-                    debug!(
-                        "Replacing media ID in query: {} -> {}",
-                        trimmed, media_mapping.original_media_id
-                    );
-                    resolved_ids.push(media_mapping.original_media_id);
-                    changed = true;
-                } else if let Ok(Some(source)) = state
+                let mut resolved_media_virtual_id = trimmed.to_string();
+                let mut can_map_media_id = true;
+
+                if let Some(dedupe_group) = state.media_storage.get_media_dedupe_group(trimmed).await {
+                    if let Some(member_for_server) = dedupe_group
+                        .members
+                        .iter()
+                        .find(|member| member.server_id == server.id)
+                    {
+                        resolved_media_virtual_id = member_for_server.virtual_media_id.clone();
+                    } else {
+                        can_map_media_id = false;
+                    }
+                }
+
+                if can_map_media_id {
+                    if let Some(media_mapping) = state
+                        .media_storage
+                        .get_media_mapping_by_virtual(&resolved_media_virtual_id)
+                        .await
+                        .unwrap_or_default()
+                    {
+                        debug!(
+                            "Replacing media ID in query: {} (resolved {}) -> {}",
+                            trimmed, resolved_media_virtual_id, media_mapping.original_media_id
+                        );
+                        resolved_ids.push(media_mapping.original_media_id);
+                        changed = true;
+                        continue;
+                    }
+                }
+
+                if let Ok(Some(source)) = state
                     .library_management
                     .resolve_source_by_virtual_id_for_server(trimmed, server.id)
                     .await
@@ -595,8 +635,38 @@ pub async fn resolve_server(
 ) -> Result<(Server, Option<AuthorizationSession>)> {
     let mut request_server = None;
 
+    if let Some(media_source_value) = request
+        .url()
+        .query_pairs()
+        .find(|(k, _)| k.eq_ignore_ascii_case("MediaSourceId"))
+        .map(|(_, v)| v.to_string())
+    {
+        for raw_id in media_source_value.split(',') {
+            let media_source_id = raw_id.trim();
+            if media_source_id.is_empty() {
+                continue;
+            }
+
+            if let Some((_mapping, server)) = state
+                .media_storage
+                .get_media_mapping_with_server(media_source_id)
+                .await?
+            {
+                debug!(
+                    "Resolved server from MediaSourceId {}: {} ({})",
+                    media_source_id, server.name, server.url
+                );
+                request_server = Some(server);
+                break;
+            }
+        }
+    }
+
     // Check URL paths for media IDs using the static configuration
     for &path_segment in MEDIA_ID_PATH_TAGS {
+        if request_server.is_some() {
+            break;
+        }
         if let Some(media_id) = contains_id(request.url(), path_segment) {
             debug!("Found {} ID in request: {}", path_segment, media_id);
             if let Some((_mapping, server)) = state

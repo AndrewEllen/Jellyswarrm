@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::{
     extract::{Request, State},
     Json,
@@ -5,18 +7,27 @@ use axum::{
 use hyper::StatusCode;
 use reqwest::header::{HeaderValue, CONTENT_LENGTH, TRANSFER_ENCODING};
 use reqwest::Body;
+use tokio::task::JoinSet;
 use tracing::{debug, error};
 
 use crate::{
-    handlers::common::{
-        execute_json_request, payload_from_request, process_media_item, process_media_source,
-        track_play_session,
+    handlers::{
+        common::{
+            execute_json_request, payload_from_request, process_media_item, process_media_source,
+            track_play_session,
+        },
+        federated::{merge_server_item_batches, ServerItemsBatch},
     },
     models::{
         enums::{BaseItemKind, CollectionType},
-        MediaItem, PlaybackRequest, PlaybackResponse,
+        ItemsResponseVariants, ItemsResponseWithCount, MediaItem, PlaybackRequest, PlaybackResponse,
     },
-    request_preprocessing::preprocess_request,
+    request_preprocessing::{
+        apply_to_request, extract_request_infos, preprocess_request, JellyfinAuthorization,
+    },
+    server_storage::Server,
+    url_helper::{contains_id, replace_id},
+    user_authorization_service::AuthorizationSession,
     AppState,
 };
 
@@ -109,6 +120,17 @@ pub async fn get_items(
     State(state): State<AppState>,
     req: Request,
 ) -> Result<Json<crate::models::ItemsResponseVariants>, StatusCode> {
+    if let Some(series_virtual_id) = extract_show_series_id_from_path(req.uri().path()) {
+        return get_show_items_with_optional_dedupe(State(state), req, series_virtual_id).await;
+    }
+
+    get_items_single_server(State(state), req).await
+}
+
+async fn get_items_single_server(
+    State(state): State<AppState>,
+    req: Request,
+) -> Result<Json<crate::models::ItemsResponseVariants>, StatusCode> {
     let preprocessed = preprocess_request(req, &state).await.map_err(|e| {
         error!("Failed to preprocess request: {}", e);
         StatusCode::BAD_REQUEST
@@ -136,6 +158,135 @@ pub async fn get_items(
             Err(e)
         }
     }
+}
+
+async fn get_show_items_with_optional_dedupe(
+    State(state): State<AppState>,
+    req: Request,
+    series_virtual_id: String,
+) -> Result<Json<crate::models::ItemsResponseVariants>, StatusCode> {
+    let Some(series_group) = state.media_storage.get_media_dedupe_group(&series_virtual_id).await else {
+        return get_items_single_server(State(state), req).await;
+    };
+
+    if series_group.members.len() < 2 {
+        return get_items_single_server(State(state), req).await;
+    }
+
+    let (original_request, _, _, sessions, _) =
+        extract_request_infos(req, &state).await.map_err(|e| {
+            error!("Failed to preprocess deduped show items request: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+
+    let sessions = sessions.ok_or(StatusCode::UNAUTHORIZED)?;
+    if sessions.is_empty() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let mut sessions_by_server: HashMap<i64, (AuthorizationSession, Server)> = HashMap::new();
+    for (session, server) in sessions {
+        sessions_by_server.entry(server.id).or_insert((session, server));
+    }
+
+    let mut targets = series_group
+        .members
+        .iter()
+        .filter_map(|member| sessions_by_server.get(&member.server_id).cloned())
+        .collect::<Vec<_>>();
+
+    if let Some(season_virtual_id) = extract_query_parameter(original_request.url(), "SeasonId") {
+        if let Some(season_group) = state.media_storage.get_media_dedupe_group(&season_virtual_id).await {
+            targets.retain(|(_, server)| {
+                season_group
+                    .members
+                    .iter()
+                    .any(|member| member.server_id == server.id)
+            });
+        } else if let Some((_, season_server)) = state
+            .media_storage
+            .get_media_mapping_with_server(&season_virtual_id)
+            .await
+            .map_err(|e| {
+                error!("Failed to resolve season server mapping: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+        {
+            targets.retain(|(_, server)| server.id == season_server.id);
+        }
+    }
+
+    if targets.is_empty() {
+        return Ok(Json(ItemsResponseVariants::WithCount(ItemsResponseWithCount {
+            items: Vec::new(),
+            total_record_count: 0,
+            start_index: 0,
+        })));
+    }
+
+    let mut join_set = JoinSet::new();
+    for (index, (session, server)) in targets.into_iter().enumerate() {
+        let Some(request) = original_request.try_clone() else {
+            continue;
+        };
+        let state_clone = state.clone();
+        join_set.spawn(async move {
+            let result =
+                fetch_show_items_for_target(state_clone, request, session, server.clone()).await;
+            (index, server, result)
+        });
+    }
+
+    let mut indexed_batches = Vec::new();
+    while let Some(join_result) = join_set.join_next().await {
+        match join_result {
+            Ok((index, server, Ok(items))) => {
+                indexed_batches.push((index, ServerItemsBatch { server, items }))
+            }
+            Ok((_index, server, Err(status))) => {
+                error!(
+                    "Failed to fetch deduped show items from server '{}': {}",
+                    server.name, status
+                );
+            }
+            Err(e) => error!("Join error while fetching deduped show items: {}", e),
+        }
+    }
+
+    indexed_batches.sort_by_key(|(index, _)| *index);
+    let batches = indexed_batches
+        .into_iter()
+        .map(|(_, batch)| batch)
+        .collect::<Vec<_>>();
+
+    let merged = merge_server_item_batches(&state, batches).await;
+    Ok(Json(merged))
+}
+
+async fn fetch_show_items_for_target(
+    state: AppState,
+    mut request: reqwest::Request,
+    session: AuthorizationSession,
+    server: Server,
+) -> Result<ItemsResponseVariants, StatusCode> {
+    let auth = Some(JellyfinAuthorization::Authorization(session.to_authorization()));
+    apply_to_request(
+        &mut request,
+        &server,
+        &Some(session),
+        &auth,
+        &state,
+    )
+    .await;
+
+    let mut response =
+        execute_json_request::<ItemsResponseVariants>(&state.reqwest_client, request).await?;
+    let server_id = { state.config.read().await.server_id.clone() };
+    for item in &mut response.iter_mut_items() {
+        *item = process_media_item(item.clone(), &state, &server, false, &server_id).await?;
+    }
+
+    Ok(response)
 }
 
 // can be used for special features etc.
@@ -181,8 +332,15 @@ pub async fn post_playback_info(
 
     let original_request = preprocessed
         .original_request
+        .as_ref()
         .ok_or(StatusCode::BAD_REQUEST)?;
-    let payload: PlaybackRequest = payload_from_request(&original_request)?;
+    let payload: PlaybackRequest = payload_from_request(original_request)?;
+
+    if let Some(grouped_playback_response) =
+        try_get_grouped_playback_info(&state, &preprocessed, original_request, &payload).await?
+    {
+        return Ok(Json(grouped_playback_response));
+    }
 
     let server = preprocessed.server;
 
@@ -236,4 +394,205 @@ pub async fn post_playback_info(
             Err(e)
         }
     }
+}
+
+async fn try_get_grouped_playback_info(
+    state: &AppState,
+    preprocessed: &crate::request_preprocessing::PreprocessedRequest,
+    original_request: &reqwest::Request,
+    payload: &PlaybackRequest,
+) -> Result<Option<PlaybackResponse>, StatusCode> {
+    let Some(requested_item_id) = extract_item_id_from_path(original_request.url().path()) else {
+        return Ok(None);
+    };
+
+    let Some(dedupe_group) = state.media_storage.get_media_dedupe_group(&requested_item_id).await else {
+        return Ok(None);
+    };
+
+    if dedupe_group.members.len() < 2 {
+        return Ok(None);
+    }
+
+    let Some(sessions) = preprocessed.sessions.clone() else {
+        return Ok(None);
+    };
+
+    let mut sessions_by_server: HashMap<i64, (AuthorizationSession, Server)> = HashMap::new();
+    for (session, server) in sessions {
+        sessions_by_server.entry(server.id).or_insert((session, server));
+    }
+
+    let selected_server_id = if let Some(media_source_id) = payload.media_source_id.as_ref() {
+        state
+            .media_storage
+            .get_media_mapping_with_server(media_source_id)
+            .await
+            .map_err(|e| {
+                error!("Failed to resolve media source mapping: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .map(|(_, server)| server.id)
+    } else {
+        None
+    };
+
+    let mut candidates = dedupe_group
+        .members
+        .iter()
+        .filter_map(|member| {
+            sessions_by_server
+                .get(&member.server_id)
+                .map(|(session, server)| (member.virtual_media_id.clone(), session.clone(), server.clone()))
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|a, b| {
+        b.2.priority
+            .cmp(&a.2.priority)
+            .then_with(|| a.2.name.cmp(&b.2.name))
+    });
+
+    if let Some(selected_server_id) = selected_server_id {
+        candidates.retain(|(_, _, server)| server.id == selected_server_id);
+    }
+
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let mut merged_sources = Vec::new();
+    let mut play_session_id = None;
+
+    for (item_virtual_id, session, server) in candidates {
+        let Some(mut request) = original_request.try_clone() else {
+            continue;
+        };
+
+        replace_item_id_for_request(&mut request, &item_virtual_id);
+
+        let mut payload_for_server = payload.clone();
+        if payload_for_server.user_id.is_some() {
+            payload_for_server.user_id = Some(session.original_user_id.clone());
+        }
+
+        if let Some(selected_server_id) = selected_server_id {
+            if server.id == selected_server_id {
+                if let Some(media_source_id) = payload_for_server.media_source_id.as_ref() {
+                    if let Some(mapping) = state
+                        .media_storage
+                        .get_media_mapping_by_virtual(media_source_id)
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to map selected media source: {}", e);
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        })?
+                    {
+                        payload_for_server.media_source_id = Some(mapping.original_media_id);
+                    }
+                }
+            } else {
+                payload_for_server.media_source_id = None;
+            }
+        } else {
+            payload_for_server.media_source_id = None;
+        }
+
+        let auth = Some(JellyfinAuthorization::Authorization(session.to_authorization()));
+        apply_to_request(
+            &mut request,
+            &server,
+            &Some(session),
+            &auth,
+            state,
+        )
+        .await;
+
+        apply_json_body_to_request(&mut request, &payload_for_server)?;
+
+        let mut response =
+            execute_json_request::<PlaybackResponse>(&state.reqwest_client, request).await?;
+
+        if play_session_id.is_none() {
+            play_session_id = Some(response.play_session_id.clone());
+        }
+
+        for source in &mut response.media_sources {
+            *source = process_media_source(source.clone(), &state.media_storage, &server).await?;
+
+            source.name = Some(match source.name.as_deref() {
+                Some(existing) if !existing.trim().is_empty() => {
+                    format!("{existing} [{}]", server.name)
+                }
+                _ => format!("{} source", server.name),
+            });
+
+            track_play_session(source, &response.play_session_id, &server, state).await?;
+            merged_sources.push(source.clone());
+        }
+    }
+
+    if merged_sources.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(PlaybackResponse {
+        media_sources: merged_sources,
+        play_session_id: play_session_id.unwrap_or_default(),
+    }))
+}
+
+fn apply_json_body_to_request(
+    request: &mut reqwest::Request,
+    payload: &PlaybackRequest,
+) -> Result<(), StatusCode> {
+    let json = serde_json::to_vec(payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let len = json.len();
+    *request.body_mut() = Some(Body::from(json));
+    request.headers_mut().insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&len.to_string()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    );
+    request.headers_mut().remove(TRANSFER_ENCODING);
+    Ok(())
+}
+
+fn replace_item_id_for_request(request: &mut reqwest::Request, item_virtual_id: &str) {
+    let mut url = request.url().clone();
+    if let Some(current_item_id) = contains_id(&url, "Items") {
+        url = replace_id(url, &current_item_id, item_virtual_id);
+    }
+    *request.url_mut() = url;
+}
+
+fn extract_show_series_id_from_path(path: &str) -> Option<String> {
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    for index in 0..segments.len() {
+        if segments[index].eq_ignore_ascii_case("shows")
+            && (index + 2) < segments.len()
+            && (segments[index + 2].eq_ignore_ascii_case("seasons")
+                || segments[index + 2].eq_ignore_ascii_case("episodes"))
+        {
+            return Some(segments[index + 1].to_string());
+        }
+    }
+
+    None
+}
+
+fn extract_query_parameter(url: &url::Url, parameter_name: &str) -> Option<String> {
+    url.query_pairs()
+        .find(|(key, _)| key.eq_ignore_ascii_case(parameter_name))
+        .and_then(|(_, value)| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
 }
